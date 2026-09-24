@@ -9,8 +9,12 @@ import (
 	"time"
 )
 
-// SendEmail transmits an email message via SMTP.
+// SendEmail transmits an email message via SMTP or Microsoft Graph API.
 func SendEmail(cfg AccountConfig, to []string, subject, body string, isHTML bool) error {
+	if cfg.IsGraph() {
+		return SendEmailGraph(cfg, to, subject, body, isHTML)
+	}
+
 	if len(to) == 0 {
 		return fmt.Errorf("no recipients specified")
 	}

@@ -231,7 +231,7 @@ func handleGetUnreadEmails(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 
 		for _, s := range summaries {
 			dateStr := s.Date.Format("02 Jan 15:04")
-			sb.WriteString(fmt.Sprintf("- **ID: `%d`** | **From:** `%s` | **Date:** %s\n", s.ID, s.From, dateStr))
+			sb.WriteString(fmt.Sprintf("- **ID: `%s`** | **From:** `%s` | **Date:** %s\n", s.ID, s.From, dateStr))
 			sb.WriteString(fmt.Sprintf("  **Subject:** %s\n", s.Subject))
 			if s.Snippet != "" {
 				sb.WriteString(fmt.Sprintf("  *Preview:* %s\n", s.Snippet))
@@ -297,7 +297,7 @@ func handleSearchEmails(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallTo
 
 		for _, s := range summaries {
 			dateStr := s.Date.Format("02 Jan 15:04")
-			sb.WriteString(fmt.Sprintf("- **ID: `%d`** | **From:** `%s` | **Date:** %s\n", s.ID, s.From, dateStr))
+			sb.WriteString(fmt.Sprintf("- **ID: `%s`** | **From:** `%s` | **Date:** %s\n", s.ID, s.From, dateStr))
 			sb.WriteString(fmt.Sprintf("  **Subject:** %s\n", s.Subject))
 			if s.Snippet != "" {
 				sb.WriteString(fmt.Sprintf("  *Preview:* %s\n", s.Snippet))
@@ -328,23 +328,18 @@ func handleReadEmail(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolR
 		return mcp.NewToolResultError("Both 'account' and 'message_id' are required"), nil
 	}
 
-	id, err := strconv.ParseUint(msgIDStr, 10, 32)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Invalid message ID '%s': must be numeric", msgIDStr)), nil
-	}
-
 	acc, ok := cfg.Accounts[account]
 	if !ok {
 		return mcp.NewToolResultError(fmt.Sprintf("Account '%s' not found", account)), nil
 	}
 
-	detail, err := ReadEmail(account, acc, uint32(id), folder, maxLen)
+	detail, err := ReadEmail(account, acc, msgIDStr, folder, maxLen)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Error reading email: %v", err)), nil
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("### Email Details [%s #%d]\n\n", detail.Account, detail.ID))
+	sb.WriteString(fmt.Sprintf("### Email Details [%s #%s]\n\n", detail.Account, detail.ID))
 	sb.WriteString(fmt.Sprintf("- **Subject:** %s\n", detail.Subject))
 	sb.WriteString(fmt.Sprintf("- **From:** %s\n", detail.From))
 	sb.WriteString(fmt.Sprintf("- **To:** %s\n", strings.Join(detail.To, ", ")))

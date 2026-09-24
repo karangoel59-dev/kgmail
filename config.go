@@ -40,6 +40,18 @@ func (a AccountConfig) IsOAuth2() bool {
 	return a.TenantID != "" && a.ClientID != ""
 }
 
+// IsGraph returns true when the account should communicate via Microsoft Graph API.
+func (a AccountConfig) IsGraph() bool {
+	provider := strings.ToLower(strings.TrimSpace(a.Provider))
+	if provider == "graph" || provider == "microsoft_graph" {
+		return true
+	}
+	if (provider == "office365" || provider == "microsoft" || provider == "outlook") && a.TenantID != "" && a.ClientID != "" && a.ClientSecret != "" {
+		return true
+	}
+	return false
+}
+
 // Config represents the top-level configuration file.
 type Config struct {
 	Accounts map[string]AccountConfig `json:"accounts"`

@@ -7,7 +7,7 @@ import (
 // EmailSummary provides lightweight metadata for unread or searched emails.
 type EmailSummary struct {
 	Account   string    `json:"account"`
-	ID        uint32    `json:"id"`
+	ID        string    `json:"id"`
 	From      string    `json:"from"`
 	Subject   string    `json:"subject"`
 	Date      time.Time `json:"date"`
@@ -18,7 +18,7 @@ type EmailSummary struct {
 // EmailDetail represents full content and metadata of an email.
 type EmailDetail struct {
 	Account     string            `json:"account"`
-	ID          uint32            `json:"id"`
+	ID          string            `json:"id"`
 	MessageID   string            `json:"message_id"`
 	From        string            `json:"from"`
 	To          []string          `json:"to"`

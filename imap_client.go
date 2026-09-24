@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,6 +103,9 @@ func DialIMAP(cfg AccountConfig, timeout time.Duration) (*client.Client, error) 
 
 // TestConnection verifies that the account can successfully connect and authenticate.
 func TestConnection(cfg AccountConfig) error {
+	if cfg.IsGraph() {
+		return TestConnectionGraph(cfg)
+	}
 	c, err := DialIMAP(cfg, 5*time.Second)
 	if err != nil {
 		return err
@@ -112,6 +116,9 @@ func TestConnection(cfg AccountConfig) error {
 
 // ListFolders returns all mailboxes/folders for the account.
 func ListFolders(cfg AccountConfig) ([]string, error) {
+	if cfg.IsGraph() {
+		return ListFoldersGraph(cfg)
+	}
 	c, err := DialIMAP(cfg, 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -138,6 +145,10 @@ func ListFolders(cfg AccountConfig) ([]string, error) {
 
 // GetUnreadEmails retrieves recent unread emails without marking them as read.
 func GetUnreadEmails(accountName string, cfg AccountConfig, folder string, limit int) ([]EmailSummary, error) {
+	if cfg.IsGraph() {
+		return GetUnreadEmailsGraph(accountName, cfg, folder, limit)
+	}
+
 	if folder == "" {
 		folder = "INBOX"
 	}
@@ -186,6 +197,10 @@ func GetUnreadEmails(accountName string, cfg AccountConfig, folder string, limit
 
 // SearchEmails searches for emails matching query in ReadOnly mode.
 func SearchEmails(accountName string, cfg AccountConfig, query string, folder string, limit int) ([]EmailSummary, error) {
+	if cfg.IsGraph() {
+		return SearchEmailsGraph(accountName, cfg, query, folder, limit)
+	}
+
 	if folder == "" {
 		folder = "INBOX"
 	}
@@ -278,7 +293,7 @@ func fetchSummaries(c *client.Client, accountName string, ids []uint32) ([]Email
 	for msg := range messages {
 		summary := EmailSummary{
 			Account: accountName,
-			ID:      msg.SeqNum,
+			ID:      fmt.Sprintf("%d", msg.SeqNum),
 		}
 
 		if msg.Envelope != nil {
@@ -321,13 +336,22 @@ func fetchSummaries(c *client.Client, accountName string, ids []uint32) ([]Email
 	return summaries, nil
 }
 
-// ReadEmail fetches and parses the full email message for a given sequence ID.
-func ReadEmail(accountName string, cfg AccountConfig, id uint32, folder string, maxBodyLen int) (*EmailDetail, error) {
+// ReadEmail fetches and parses the full email message for a given ID.
+func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, maxBodyLen int) (*EmailDetail, error) {
+	if cfg.IsGraph() {
+		return ReadEmailGraph(accountName, cfg, id, maxBodyLen)
+	}
+
 	if folder == "" {
 		folder = "INBOX"
 	}
 	if maxBodyLen <= 0 {
 		maxBodyLen = defaultMaxBodyLen
+	}
+
+	numID, parseErr := strconv.ParseUint(id, 10, 32)
+	if parseErr != nil {
+		return nil, fmt.Errorf("invalid message ID '%s' for IMAP: must be numeric sequence number", id)
 	}
 
 	c, err := DialIMAP(cfg, 20*time.Second)
@@ -343,7 +367,7 @@ func ReadEmail(accountName string, cfg AccountConfig, id uint32, folder string, 
 	}
 
 	seqset := new(imap.SeqSet)
-	seqset.AddNum(id)
+	seqset.AddNum(uint32(numID))
 
 	// Request entire RFC822 message via BODY.PEEK[] so unread flag is preserved
 	section := &imap.BodySectionName{Peek: true}
@@ -362,16 +386,16 @@ func ReadEmail(accountName string, cfg AccountConfig, id uint32, folder string, 
 
 	msg := <-messages
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("fetch failed for message ID %d: %w", id, err)
+		return nil, fmt.Errorf("fetch failed for message ID %s: %w", id, err)
 	}
 
 	if msg == nil {
-		return nil, fmt.Errorf("message %d not found in %s", id, folder)
+		return nil, fmt.Errorf("message %s not found in %s", id, folder)
 	}
 
 	detail := &EmailDetail{
 		Account: accountName,
-		ID:      msg.SeqNum,
+		ID:      fmt.Sprintf("%d", msg.SeqNum),
 		Headers: make(map[string]string),
 	}
 

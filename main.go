@@ -4,14 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const version = "2.1.0"
+const version = "2.2.0"
 
 func printUsage() {
 	fmt.Printf(`kgmail %s - Multi-Account Email Manager & MCP Server
@@ -222,7 +221,7 @@ func runUnread() {
 
 		total += len(summaries)
 		for _, s := range summaries {
-			fmt.Printf("  • [ID: %d] %s | %s\n", s.ID, s.Date.Format("02 Jan 15:04"), s.From)
+			fmt.Printf("  • [ID: %s] %s | %s\n", s.ID, s.Date.Format("02 Jan 15:04"), s.From)
 			fmt.Printf("    Subject: %s\n", s.Subject)
 			if s.Snippet != "" {
 				fmt.Printf("    Snippet: %s\n", s.Snippet)
@@ -287,7 +286,7 @@ func runSearch() {
 
 		total += len(summaries)
 		for _, s := range summaries {
-			fmt.Printf("  • [ID: %d] %s | %s\n", s.ID, s.Date.Format("02 Jan 15:04"), s.From)
+			fmt.Printf("  • [ID: %s] %s | %s\n", s.ID, s.Date.Format("02 Jan 15:04"), s.From)
 			fmt.Printf("    Subject: %s\n", s.Subject)
 			if s.Snippet != "" {
 				fmt.Printf("    Snippet: %s\n", s.Snippet)
@@ -315,12 +314,6 @@ func runRead() {
 	maxLen := fs.Int("max-len", defaultMaxBodyLen, "Max body length")
 	fs.Parse(os.Args[4:])
 
-	id, err := strconv.ParseUint(msgIDStr, 10, 32)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid message ID '%s': must be numeric\n", msgIDStr)
-		os.Exit(1)
-	}
-
 	cfg, _, err := LoadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
@@ -333,14 +326,14 @@ func runRead() {
 		os.Exit(1)
 	}
 
-	detail, err := ReadEmail(account, acc, uint32(id), *folder, *maxLen)
+	detail, err := ReadEmail(account, acc, msgIDStr, *folder, *maxLen)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read email: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Println(strings.Repeat("=", 70))
-	fmt.Printf("Account: %s | Message ID: %d\n", detail.Account, detail.ID)
+	fmt.Printf("Account: %s | Message ID: %s\n", detail.Account, detail.ID)
 	fmt.Printf("From:    %s\n", detail.From)
 	fmt.Printf("To:      %s\n", strings.Join(detail.To, ", "))
 	if len(detail.Cc) > 0 {
