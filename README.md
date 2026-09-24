@@ -80,12 +80,46 @@ go install github.com/karangoel59-dev/kgmail@latest
       "username": "user@zohomail.in",
       "password": "your-zoho-app-password",
       "enabled": true
+    },
+    "work": {
+      "provider": "office365",
+      "username": "user@company.com",
+      "tenant_id": "your-azure-tenant-id-or-common",
+      "client_id": "your-azure-app-client-id",
+      "enabled": true
     }
   }
 }
 ```
 
 > **Note for Gmail Users**: Gmail requires an **App Password** (generated under Google Account > Security > 2-Step Verification > App Passwords). Spaces in 16-character app passwords are automatically stripped.
+
+### 🏢 Microsoft 365 / Exchange Online OAuth 2.0 (Azure AD)
+
+Since Microsoft disabled Basic Auth / App Passwords for Exchange Online, organizational Microsoft 365 accounts use **OAuth 2.0 (XOAUTH2)** via Azure AD:
+
+1. **Register an Azure AD App** at [portal.azure.com](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations** → **New registration**:
+   - Supported account types: *Accounts in this organizational directory only* (single tenant) or *Any Azure AD directory* (multi-tenant).
+   - Under **Authentication** → **Advanced settings** → **Allow public client flows**: Select **Yes**.
+2. **Add Delegated API Permissions**:
+   - Under **API permissions** → **Add a permission** → **APIs my organization uses** (search `Office 365 Exchange Online` or add via Microsoft Graph):
+     - `IMAP.AccessAsUser.All` (Read/write access to mailboxes via IMAP)
+     - `SMTP.Send` (Send mail on behalf of signed-in user)
+     - `offline_access` (Maintain access to data you have given it access to / refresh tokens)
+   - Grant admin consent if required by your tenant policy.
+3. **Add Account to kgmail**:
+   ```bash
+   kgmail add-account work --provider office365 \
+     --user karan.goel@chat360.io \
+     --client-id <YOUR_CLIENT_ID> \
+     --tenant-id <YOUR_TENANT_ID>
+   ```
+4. **Authenticate via Browser**:
+   `kgmail` initiates the device-code flow:
+   ```bash
+   kgmail auth-microsoft work
+   ```
+   Open `https://microsoft.com/devicelogin`, enter the user code shown in terminal, and log in with your work email. `kgmail` automatically stores the access/refresh tokens and silently refreshes them before expiration.
 
 ---
 

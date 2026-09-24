@@ -78,3 +78,64 @@ func TestSaveAndLoadConfig(t *testing.T) {
 		t.Errorf("expected default port 993, got: %d", workAcc.Port)
 	}
 }
+
+func TestOAuth2ConfigAndTokens(t *testing.T) {
+	acc := AccountConfig{
+		Provider: "office365",
+		Username: "karan.goel@chat360.io",
+		ClientID: "client-12345",
+	}
+
+	norm := normalizeAccount(acc)
+	if !norm.IsOAuth2() {
+		t.Errorf("expected IsOAuth2 to be true")
+	}
+	if norm.TenantID != "common" {
+		t.Errorf("expected default TenantID to be 'common', got: %s", norm.TenantID)
+	}
+	if norm.Host != "outlook.office365.com" {
+		t.Errorf("expected Host outlook.office365.com, got: %s", norm.Host)
+	}
+	if norm.SMTPHost != "smtp.office365.com" {
+		t.Errorf("expected SMTPHost smtp.office365.com, got: %s", norm.SMTPHost)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "kgmail-oauth-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpConfig := filepath.Join(tmpDir, "config.json")
+	t.Setenv("KGMAIL_CONFIG", tmpConfig)
+
+	cfg := &Config{
+		Accounts: map[string]AccountConfig{
+			"m365": norm,
+		},
+	}
+	if err := SaveConfig(cfg, tmpConfig); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	// Update tokens
+	if err := UpdateAccountTokens("m365", "access-token-abc", "refresh-token-xyz", 1899999999); err != nil {
+		t.Fatalf("failed to update tokens: %v", err)
+	}
+
+	reloaded, _, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("failed to reload config: %v", err)
+	}
+
+	m365Acc := reloaded.Accounts["m365"]
+	if m365Acc.AccessToken != "access-token-abc" {
+		t.Errorf("expected access token 'access-token-abc', got: %s", m365Acc.AccessToken)
+	}
+	if m365Acc.RefreshToken != "refresh-token-xyz" {
+		t.Errorf("expected refresh token 'refresh-token-xyz', got: %s", m365Acc.RefreshToken)
+	}
+	if m365Acc.TokenExpiry != 1899999999 {
+		t.Errorf("expected token expiry 1899999999, got: %d", m365Acc.TokenExpiry)
+	}
+}

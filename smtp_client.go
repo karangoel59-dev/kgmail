@@ -33,12 +33,25 @@ func SendEmail(cfg AccountConfig, to []string, subject, body string, isHTML bool
 		pass = cfg.Password
 	}
 
-	if host == "" || user == "" || pass == "" {
-		return fmt.Errorf("SMTP configuration incomplete for user %s", cfg.Username)
+	if host == "" || user == "" {
+		return fmt.Errorf("SMTP configuration incomplete for user %s: missing host or username", cfg.Username)
 	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
-	auth := smtp.PlainAuth("", user, pass, host)
+	var auth smtp.Auth
+
+	if cfg.IsOAuth2() {
+		token, tokenErr := GetOrRefreshMicrosoftToken(&cfg)
+		if tokenErr != nil {
+			return fmt.Errorf("SMTP OAuth2 token error for %s: %w", cfg.Username, tokenErr)
+		}
+		auth = newSMTPXOAuth2Auth(user, token)
+	} else {
+		if pass == "" {
+			return fmt.Errorf("SMTP configuration incomplete for user %s: password required", cfg.Username)
+		}
+		auth = smtp.PlainAuth("", user, pass, host)
+	}
 
 	contentType := "text/plain; charset=UTF-8"
 	if isHTML {

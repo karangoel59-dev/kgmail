@@ -10,13 +10,13 @@ import (
 
 // AccountConfig defines the settings for an individual email account.
 type AccountConfig struct {
-	Provider string `json:"provider"`           // gmail, zoho, outlook, imap
+	Provider string `json:"provider"`           // gmail, zoho, outlook, office365, imap
 	Host     string `json:"host"`               // IMAP host
 	Port     int    `json:"port,omitempty"`     // IMAP port (default: 993)
 	SSL      *bool  `json:"ssl,omitempty"`      // Use TLS/SSL (default: true)
 	StartTLS bool   `json:"starttls,omitempty"` // Use StartTLS (default: false)
 	Username string `json:"username"`           // Username / email address
-	Password string `json:"password"`           // Password or App Password
+	Password string `json:"password"`           // Password or App Password (empty when using OAuth2)
 	Enabled  *bool  `json:"enabled,omitempty"`  // Enabled flag (default: true)
 
 	// SMTP configuration (optional, for sending emails)
@@ -24,6 +24,20 @@ type AccountConfig struct {
 	SMTPPort int    `json:"smtp_port,omitempty"` // SMTP port (default: 587 or 465)
 	SMTPUser string `json:"smtp_user,omitempty"` // SMTP username (defaults to Username)
 	SMTPPass string `json:"smtp_pass,omitempty"` // SMTP password (defaults to Password)
+
+	// Microsoft 365 / Azure AD OAuth2 (device-code flow)
+	// Set tenant_id + client_id to use OAuth2 instead of password auth.
+	TenantID     string `json:"tenant_id,omitempty"`     // Azure AD tenant ID (or "common")
+	ClientID     string `json:"client_id,omitempty"`     // Azure App registration client ID
+	ClientSecret string `json:"client_secret,omitempty"` // Client secret (optional, for confidential apps)
+	AccessToken  string `json:"access_token,omitempty"`  // Cached access token (managed by kgmail)
+	RefreshToken string `json:"refresh_token,omitempty"` // Refresh token (managed by kgmail)
+	TokenExpiry  int64  `json:"token_expiry,omitempty"`  // Unix timestamp when access token expires
+}
+
+// IsOAuth2 returns true when the account is configured for OAuth2 (has tenant+client IDs).
+func (a AccountConfig) IsOAuth2() bool {
+	return a.TenantID != "" && a.ClientID != ""
 }
 
 // Config represents the top-level configuration file.
@@ -180,12 +194,43 @@ func normalizeAccount(acc AccountConfig) AccountConfig {
 			acc.Host = "outlook.office365.com"
 		}
 		if acc.SMTPHost == "" {
-			acc.SMTPHost = "smtp-mail.outlook.com"
+			acc.SMTPHost = "smtp.office365.com"
 		}
 		if acc.SMTPPort == 0 {
 			acc.SMTPPort = 587
 		}
+		if acc.TenantID == "" && acc.ClientID != "" {
+			acc.TenantID = "common"
+		}
 	}
 
 	return acc
+}
+
+// UpdateAccountTokens saves updated OAuth2 access/refresh tokens for an account back to disk.
+func UpdateAccountTokens(identifier string, accessToken, refreshToken string, expiry int64) error {
+	cfg, cfgPath, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+
+	found := false
+	for name, acc := range cfg.Accounts {
+		if name == identifier || strings.EqualFold(acc.Username, identifier) {
+			acc.AccessToken = accessToken
+			if refreshToken != "" {
+				acc.RefreshToken = refreshToken
+			}
+			acc.TokenExpiry = expiry
+			cfg.Accounts[name] = acc
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("account %s not found in configuration", identifier)
+	}
+
+	return SaveConfig(cfg, cfgPath)
 }

@@ -30,8 +30,11 @@ func DialIMAP(cfg AccountConfig, timeout time.Duration) (*client.Client, error) 
 		port = 993
 	}
 
-	if host == "" || cfg.Username == "" || cfg.Password == "" {
-		return nil, fmt.Errorf("account configuration missing required host, username, or password")
+	if host == "" || cfg.Username == "" {
+		return nil, fmt.Errorf("account configuration missing required host or username")
+	}
+	if !cfg.IsOAuth2() && cfg.Password == "" {
+		return nil, fmt.Errorf("account has no password and is not configured for OAuth2 (set tenant_id + client_id)")
 	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
@@ -74,10 +77,24 @@ func DialIMAP(cfg AccountConfig, timeout time.Duration) (*client.Client, error) 
 	// Set overall command timeout
 	c.Timeout = timeout
 
-	// Login
-	if err := c.Login(cfg.Username, cfg.Password); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("IMAP login failed for %s on %s: %w", cfg.Username, host, err)
+	if cfg.IsOAuth2() {
+		// Get (or refresh) the Microsoft access token, then authenticate via XOAUTH2
+		token, tokenErr := GetOrRefreshMicrosoftToken(&cfg)
+		if tokenErr != nil {
+			c.Close()
+			return nil, fmt.Errorf("OAuth2 token error for %s: %w", cfg.Username, tokenErr)
+		}
+		saslClient := newXOAuth2Client(cfg.Username, token)
+		if authErr := c.Authenticate(saslClient); authErr != nil {
+			c.Close()
+			return nil, fmt.Errorf("IMAP XOAUTH2 auth failed for %s on %s: %w", cfg.Username, host, authErr)
+		}
+	} else {
+		// Standard username / password login
+		if err := c.Login(cfg.Username, cfg.Password); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("IMAP login failed for %s on %s: %w", cfg.Username, host, err)
+		}
 	}
 
 	return c, nil

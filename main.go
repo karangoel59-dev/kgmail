@@ -11,7 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const version = "2.0.0"
+const version = "2.1.0"
 
 func printUsage() {
 	fmt.Printf(`kgmail %s - Multi-Account Email Manager & MCP Server
@@ -29,6 +29,7 @@ COMMANDS:
   send                          Send an email via SMTP
   add-account <name>            Add or update an email account
   remove-account <name>         Remove an email account
+  auth-microsoft <name>         Authorize Microsoft 365 account via browser (device-code)
   config                        Show resolved configuration file path and accounts
   version                       Show kgmail version
 
@@ -50,8 +51,14 @@ EXAMPLES:
   # Read an email:
   kgmail read google 1234
 
-  # Add an account:
-  kgmail add-account work --provider gmail --user myemail@gmail.com --password <token>
+  # Add an account with password / app password:
+  kgmail add-account personal --provider gmail --user myemail@gmail.com --password <token>
+
+  # Add a Microsoft 365 organization account with OAuth2:
+  kgmail add-account work --provider office365 --user karan.goel@chat360.io --client-id <CLIENT_ID> --tenant-id <TENANT_ID>
+
+  # Re-authorize Microsoft 365 account:
+  kgmail auth-microsoft work
 `, version)
 }
 
@@ -95,6 +102,9 @@ func main() {
 	case "remove-account", "rm":
 		runRemoveAccount()
 
+	case "auth-microsoft", "auth-m365", "login-microsoft":
+		runAuthMicrosoft()
+
 	case "config":
 		cfg, path, err := LoadConfig()
 		if err != nil {
@@ -108,7 +118,11 @@ func main() {
 			if acc.Enabled != nil && !*acc.Enabled {
 				en = "disabled"
 			}
-			fmt.Printf("  • %s (%s, %s, %s:%d) [%s]\n", name, acc.Provider, acc.Username, acc.Host, acc.Port, en)
+			authMode := "password"
+			if acc.IsOAuth2() {
+				authMode = fmt.Sprintf("OAuth2 (tenant: %s, client_id: %s)", acc.TenantID, acc.ClientID)
+			}
+			fmt.Printf("  • %s (%s, %s, %s:%d, %s) [%s]\n", name, acc.Provider, acc.Username, acc.Host, acc.Port, authMode, en)
 		}
 
 	case "version", "-v", "--version":
@@ -414,21 +428,29 @@ func runSend() {
 
 func runAddAccount() {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: kgmail add-account <name> --provider <gmail|zoho|outlook|imap> --user <user> --password <pass> [--host <host>] [--port <port>]")
+		fmt.Println("Usage: kgmail add-account <name> --provider <gmail|zoho|office365|imap> --user <user> [--password <pass>] [--client-id <id>] [--tenant-id <id>] [--client-secret <sec>]")
 		os.Exit(1)
 	}
 
 	name := os.Args[2]
 	fs := flag.NewFlagSet("add-account", flag.ExitOnError)
-	provider := fs.String("provider", "imap", "Provider (gmail, zoho, outlook, imap)")
+	provider := fs.String("provider", "imap", "Provider (gmail, zoho, office365, outlook, imap)")
 	user := fs.String("user", "", "Username / email address")
 	pass := fs.String("password", "", "Password or App Password")
 	host := fs.String("host", "", "IMAP host (optional if provider specified)")
 	port := fs.Int("port", 993, "IMAP port")
+	tenantID := fs.String("tenant-id", "", "Azure AD Tenant ID (or 'common'/'organizations')")
+	clientID := fs.String("client-id", "", "Azure AD Application (client) ID")
+	clientSecret := fs.String("client-secret", "", "Azure AD Client Secret (optional)")
 	fs.Parse(os.Args[3:])
 
-	if *user == "" || *pass == "" {
-		fmt.Fprintln(os.Stderr, "Error: --user and --password are required.")
+	if *user == "" {
+		fmt.Fprintln(os.Stderr, "Error: --user is required.")
+		os.Exit(1)
+	}
+
+	if *clientID == "" && *pass == "" {
+		fmt.Fprintln(os.Stderr, "Error: either --password or --client-id is required.")
 		os.Exit(1)
 	}
 
@@ -441,16 +463,34 @@ func runAddAccount() {
 	ssl := true
 	enabled := true
 	acc := AccountConfig{
-		Provider: *provider,
-		Username: *user,
-		Password: *pass,
-		Host:     *host,
-		Port:     *port,
-		SSL:      &ssl,
-		Enabled:  &enabled,
+		Provider:     *provider,
+		Username:     *user,
+		Password:     *pass,
+		Host:         *host,
+		Port:         *port,
+		SSL:          &ssl,
+		Enabled:      &enabled,
+		TenantID:     *tenantID,
+		ClientID:     *clientID,
+		ClientSecret: *clientSecret,
 	}
 
 	acc = normalizeAccount(acc)
+
+	if acc.IsOAuth2() && acc.AccessToken == "" && acc.RefreshToken == "" && acc.ClientSecret == "" {
+		// Save the account configuration skeleton first
+		cfg.Accounts[name] = acc
+		if err := SaveConfig(cfg, cfgPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save initial config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Account '%s' saved. Starting Microsoft 365 OAuth 2.0 device code authorization...\n", name)
+		if err := MicrosoftDeviceCodeFlow(name, &acc); err != nil {
+			fmt.Fprintf(os.Stderr, "Authentication error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	fmt.Printf("Testing connection to %s for %s (%s)...\n", acc.Host, acc.Username, acc.Provider)
 	if err := TestConnection(acc); err != nil {
@@ -466,6 +506,36 @@ func runAddAccount() {
 	}
 
 	fmt.Printf("✅ Account '%s' saved to %s.\n", name, cfgPath)
+}
+
+func runAuthMicrosoft() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: kgmail auth-microsoft <account>")
+		os.Exit(1)
+	}
+
+	name := os.Args[2]
+	cfg, cfgPath, err := LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	acc, ok := cfg.Accounts[name]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Account '%s' not found in %s.\n", name, cfgPath)
+		os.Exit(1)
+	}
+
+	if acc.ClientID == "" {
+		fmt.Fprintf(os.Stderr, "Account '%s' does not have a client_id configured.\nUpdate your config with client_id and tenant_id first.\n", name)
+		os.Exit(1)
+	}
+
+	if err := MicrosoftDeviceCodeFlow(name, &acc); err != nil {
+		fmt.Fprintf(os.Stderr, "OAuth2 authorization failed: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func runRemoveAccount() {
