@@ -25,6 +25,20 @@ func TestBuildMCPServer(t *testing.T) {
 		}
 	}
 
+	for _, name := range []string{"move_emails", "create_folder"} {
+		tool, ok := tools[name]
+		if !ok {
+			t.Fatalf("tool %s not registered", name)
+		}
+		a := tool.Tool.Annotations
+		if a.ReadOnlyHint == nil || *a.ReadOnlyHint {
+			t.Errorf("expected %s not to be read-only", name)
+		}
+		if a.DestructiveHint == nil || *a.DestructiveHint {
+			t.Errorf("expected %s to be annotated non-destructive (it is reversible)", name)
+		}
+	}
+
 	send, ok := tools["send_email"]
 	if !ok {
 		t.Fatalf("tool send_email not registered")

@@ -25,6 +25,8 @@ COMMANDS:
   search <query>                Search emails across accounts by keyword
   read <account> <id>           Read full email content and headers by ID
   folders <account>             List all mailboxes/folders for an account
+  move <account> <ids> <folder> Move emails (comma-separated IDs) into a folder
+  mkdir <account> <folder>      Create a mail folder ("Parent/Child" for nested)
   send                          Send an email (SMTP or Microsoft Graph)
   add-account <name>            Add or update an email account
   remove-account <name>         Remove an email account
@@ -49,6 +51,11 @@ EXAMPLES:
 
   # Read an email:
   kgmail read google 1234
+
+  # Organize: file emails into a folder (create it if needed)
+  kgmail move google 1234,1235 Receipts --create
+  kgmail move google 88 INBOX --folder Receipts
+  kgmail mkdir work "Projects/2026"
 
   # Send an email (optionally as a threaded reply):
   kgmail send --account google --to a@x.com --cc b@x.com --subject "Hi" --body "Hello"
@@ -95,6 +102,12 @@ func main() {
 
 	case "folders":
 		runFolders()
+
+	case "move", "mv":
+		runMove()
+
+	case "mkdir", "create-folder":
+		runMkdir()
 
 	case "send":
 		runSend()
@@ -375,6 +388,79 @@ func runFolders() {
 	fmt.Printf("Available folders for [%s] (%d):\n", account, len(folders))
 	for _, f := range folders {
 		fmt.Printf("  • %s\n", f)
+	}
+}
+
+func runMove() {
+	if len(os.Args) < 5 {
+		fmt.Println("Usage: kgmail move <account> <id[,id...]> <destination> [--folder SOURCE] [--create]")
+		os.Exit(1)
+	}
+
+	account := os.Args[2]
+	ids := splitAddressList(os.Args[3])
+	dest := os.Args[4]
+
+	fs := flag.NewFlagSet("move", flag.ExitOnError)
+	folder := fs.String("folder", "INBOX", "Folder the emails are currently in")
+	create := fs.Bool("create", false, "Create the destination folder if it doesn't exist")
+	fs.Parse(os.Args[5:])
+
+	cfg, _, err := LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+	acc, ok := cfg.Accounts[account]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Account '%s' not found.\n", account)
+		os.Exit(1)
+	}
+
+	result, err := MoveEmails(acc, ids, *folder, dest, *create)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to move emails: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Moved %d email(s) to %s.\n", len(result.Moved), dest)
+	for _, m := range result.Moved {
+		if m.NewID != "" {
+			fmt.Printf("  %s -> %s\n", m.ID, m.NewID)
+		}
+	}
+	if len(result.NotFound) > 0 {
+		fmt.Printf("⚠️ Not found: %s\n", strings.Join(result.NotFound, ", "))
+	}
+}
+
+func runMkdir() {
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: kgmail mkdir <account> <folder>")
+		os.Exit(1)
+	}
+
+	account, name := os.Args[2], os.Args[3]
+	cfg, _, err := LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+	acc, ok := cfg.Accounts[account]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Account '%s' not found.\n", account)
+		os.Exit(1)
+	}
+
+	created, err := CreateFolder(acc, name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create folder: %v\n", err)
+		os.Exit(1)
+	}
+	if created {
+		fmt.Printf("✅ Created folder %s in [%s].\n", name, account)
+	} else {
+		fmt.Printf("Folder %s already exists in [%s].\n", name, account)
 	}
 }
 
