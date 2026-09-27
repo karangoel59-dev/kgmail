@@ -27,6 +27,8 @@ A lightweight, high-performance Multi-Account Email Manager and native **Model C
 | `search_emails` | Searches emails by keyword, sender, or subject across accounts | `query` *(required)*, `account`, `limit`, `folder` |
 | `read_email` | Retrieves full headers, recipients, and sanitized body for an email by ID | `account` *(required)*, `message_id` *(required)*, `folder`, `max_length` |
 | `list_folders` | Lists all available mailboxes/folders for an account (e.g. INBOX, Sent, Archive, Spam) | `account` *(required)* |
+| `move_emails` | Moves emails into another folder to organize the mailbox; unread status is preserved and moves are reversible | `account` *(required)*, `message_ids` *(required)*, `destination` *(required)*, `folder`, `create_if_missing` |
+| `create_folder` | Creates a mail folder; use `/` for nested folders (e.g. `Receipts/2026`) | `account` *(required)*, `name` *(required)* |
 | `send_email` | Sends an email via SMTP (or Microsoft Graph for Graph accounts). Annotated as destructive so MCP clients can ask before sending | `account` *(required)*, `to` *(required)*, `subject` *(required)*, `body` *(required)*, `cc`, `bcc`, `is_html`, `in_reply_to` |
 
 ---
@@ -142,6 +144,11 @@ kgmail read google 197
 
 # List folders / mailboxes
 kgmail folders google
+
+# Organize: move emails into a folder (IDs from unread/search; --create makes the folder if missing)
+kgmail move google 1234,1235 Receipts --create
+kgmail move google 88 INBOX --folder Receipts
+kgmail mkdir work "Projects/2026"
 
 # Send an email via SMTP
 kgmail send --account google --to colleague@example.com --subject "Meeting update" --body "See you at 3 PM."

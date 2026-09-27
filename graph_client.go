@@ -140,31 +140,112 @@ func graphAPIRequest(cfg *AccountConfig, method, apiURL string, body []byte) ([]
 	return respBytes, nil
 }
 
-// resolveGraphFolder turns a folder name (as shown by ListFoldersGraph) into a Graph folder path segment.
-// Well-known names map directly; other names are looked up by display name; anything else is assumed to be a folder ID.
+// splitFolderPath splits a "Parent/Child" folder path into its non-empty segments.
+func splitFolderPath(path string) []string {
+	var segments []string
+	for _, seg := range strings.Split(path, "/") {
+		if seg = strings.TrimSpace(seg); seg != "" {
+			segments = append(segments, seg)
+		}
+	}
+	return segments
+}
+
+// walkGraphFolder resolves as many segments of a folder path as exist. It returns the
+// ID (or well-known name) of the deepest folder found and how many segments were resolved.
+func walkGraphFolder(cfg *AccountConfig, segments []string) (string, int, error) {
+	id := ""
+	for i, seg := range segments {
+		if i == 0 {
+			if wk, ok := graphWellKnownFolders[strings.ToLower(seg)]; ok {
+				id = wk
+				continue
+			}
+		}
+
+		listURL := graphUserURL(*cfg) + "/mailFolders"
+		if id != "" {
+			listURL += "/" + url.PathEscape(id) + "/childFolders"
+		}
+		apiURL := fmt.Sprintf("%s?$filter=displayName%%20eq%%20'%s'&$select=id",
+			listURL, graphQueryEscape(strings.ReplaceAll(seg, "'", "''")))
+		data, err := graphAPIRequest(cfg, "GET", apiURL, nil)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to look up folder %q: %w", seg, err)
+		}
+		var resp graphFolderListResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return "", 0, err
+		}
+		if len(resp.Value) == 0 {
+			return id, i, nil
+		}
+		id = resp.Value[0].ID
+	}
+	return id, len(segments), nil
+}
+
+// resolveGraphFolder turns a folder name or "Parent/Child" path (as shown by ListFoldersGraph)
+// into a Graph folder path segment. Well-known names map directly; other names are looked up
+// by display name; a single unknown name is assumed to be a folder ID.
 func resolveGraphFolder(cfg *AccountConfig, folder string) (string, error) {
-	folder = strings.TrimSpace(folder)
-	if folder == "" {
+	segments := splitFolderPath(folder)
+	if len(segments) == 0 {
 		return "inbox", nil
 	}
-	if wk, ok := graphWellKnownFolders[strings.ToLower(folder)]; ok {
-		return wk, nil
-	}
-
-	apiURL := fmt.Sprintf("%s/mailFolders?$filter=displayName%%20eq%%20'%s'&$select=id",
-		graphUserURL(*cfg), graphQueryEscape(strings.ReplaceAll(folder, "'", "''")))
-	data, err := graphAPIRequest(cfg, "GET", apiURL, nil)
+	id, resolved, err := walkGraphFolder(cfg, segments)
 	if err != nil {
-		return "", fmt.Errorf("failed to look up folder %q: %w", folder, err)
-	}
-	var resp graphFolderListResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
 		return "", err
 	}
-	if len(resp.Value) > 0 {
-		return url.PathEscape(resp.Value[0].ID), nil
+	if resolved == len(segments) {
+		return url.PathEscape(id), nil
 	}
-	return url.PathEscape(folder), nil
+	if len(segments) == 1 {
+		return url.PathEscape(strings.TrimSpace(folder)), nil
+	}
+	return "", fmt.Errorf("folder %q not found", folder)
+}
+
+// ensureGraphFolder returns the ID of the folder at path, creating missing segments when create is true.
+// It reports whether any folder was created.
+func ensureGraphFolder(cfg *AccountConfig, path string, create bool) (string, bool, error) {
+	segments := splitFolderPath(path)
+	if len(segments) == 0 {
+		return "", false, fmt.Errorf("folder name is required")
+	}
+	id, resolved, err := walkGraphFolder(cfg, segments)
+	if err != nil {
+		return "", false, err
+	}
+	if resolved == len(segments) {
+		return id, false, nil
+	}
+	if !create {
+		return "", false, fmt.Errorf("folder %q does not exist (use list_folders to see existing folders, or create it first)", path)
+	}
+
+	for _, seg := range segments[resolved:] {
+		createURL := graphUserURL(*cfg) + "/mailFolders"
+		if id != "" {
+			createURL += "/" + url.PathEscape(id) + "/childFolders"
+		}
+		body, err := json.Marshal(map[string]string{"displayName": seg})
+		if err != nil {
+			return "", false, err
+		}
+		data, err := graphAPIRequest(cfg, "POST", createURL, body)
+		if err != nil {
+			return "", false, fmt.Errorf("failed to create folder %q: %w", seg, err)
+		}
+		var created struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(data, &created); err != nil {
+			return "", false, err
+		}
+		id = created.ID
+	}
+	return id, true, nil
 }
 
 func formatGraphRecipient(r *graphRecipient) string {
@@ -387,4 +468,41 @@ func SendEmailGraph(cfg AccountConfig, msg OutgoingEmail) error {
 		return err
 	}
 	return nil
+}
+
+// CreateFolderGraph creates a mail folder (and any missing parents) for a "Parent/Child" path.
+// It reports false when the folder already existed.
+func CreateFolderGraph(cfg AccountConfig, path string) (bool, error) {
+	_, created, err := ensureGraphFolder(&cfg, path, true)
+	return created, err
+}
+
+// MoveEmailsGraph moves messages to dest. Graph assigns moved messages new IDs, which are returned.
+func MoveEmailsGraph(cfg AccountConfig, ids []string, dest string, createIfMissing bool) (*MoveResult, error) {
+	destID, _, err := ensureGraphFolder(&cfg, dest, createIfMissing)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(map[string]string{"destinationId": destID})
+	if err != nil {
+		return nil, err
+	}
+
+	result := &MoveResult{}
+	for _, id := range ids {
+		data, err := graphAPIRequest(&cfg, "POST", fmt.Sprintf("%s/messages/%s/move", graphUserURL(cfg), url.PathEscape(id)), body)
+		if err != nil {
+			if strings.Contains(err.Error(), "HTTP 404") {
+				result.NotFound = append(result.NotFound, id)
+				continue
+			}
+			return result, fmt.Errorf("failed to move message %s: %w", id, err)
+		}
+		var moved struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(data, &moved)
+		result.Moved = append(result.Moved, MovedEmail{ID: id, NewID: moved.ID})
+	}
+	return result, nil
 }
