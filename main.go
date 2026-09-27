@@ -10,7 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const version = "2.2.0"
+const version = "2.3.0"
 
 func printUsage() {
 	fmt.Printf(`kgmail %s - Multi-Account Email Manager & MCP Server
