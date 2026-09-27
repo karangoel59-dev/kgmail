@@ -35,7 +35,19 @@ A lightweight, high-performance Multi-Account Email Manager and native **Model C
 
 ## 🚀 Installation
 
-### 1. Build and Install from Source
+### 1. Download a Release Binary
+
+Prebuilt binaries for macOS, Linux and Windows are attached to each [GitHub release](https://github.com/karangoel59-dev/kgmail/releases/latest), along with a `SHA256SUMS` file.
+
+```bash
+# macOS on Apple Silicon (use kgmail-darwin-amd64 on Intel Macs, kgmail-linux-amd64 on Linux)
+curl -LO https://github.com/karangoel59-dev/kgmail/releases/latest/download/kgmail-darwin-arm64
+chmod +x kgmail-darwin-arm64
+xattr -d com.apple.quarantine kgmail-darwin-arm64 2>/dev/null  # macOS only: allow the unsigned binary
+sudo mv kgmail-darwin-arm64 /usr/local/bin/kgmail
+```
+
+### 2. Build and Install from Source
 
 ```bash
 git clone https://github.com/karangoel59-dev/kgmail.git
@@ -224,3 +236,13 @@ go test -v ./...
 ## 📄 License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## 📦 Releasing
+
+Releases are built by GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
+
+1. Bump `const version` in `main.go` and merge it to `main`.
+2. Tag the commit and push the tag: `git tag -a v2.4.0 -m v2.4.0 && git push origin v2.4.0`.
+3. The workflow runs the tests, checks the tag matches `main.go`, builds binaries for macOS, Linux and Windows, and publishes the release with generated notes and checksums.
