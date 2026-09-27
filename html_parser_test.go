@@ -47,3 +47,17 @@ func TestStripHTML_EmptyAndPlain(t *testing.T) {
 		t.Errorf("expected plain text to be preserved, got: %s", StripHTML(plain))
 	}
 }
+
+func TestStripHTML_LinksAndEntities(t *testing.T) {
+	out := StripHTML(`<p>Click <a href="https://example.com/verify">here</a> or visit <a href="https://example.com">https://example.com</a>. Literal: &amp;lt;b&amp;gt;</p>`)
+
+	if !strings.Contains(out, "here (https://example.com/verify)") {
+		t.Errorf("expected link target after link text, got: %s", out)
+	}
+	if strings.Count(out, "https://example.com ") > 1 || strings.Contains(out, "(https://example.com)") {
+		t.Errorf("expected bare-URL link not to be duplicated, got: %s", out)
+	}
+	if !strings.Contains(out, "&lt;b&gt;") {
+		t.Errorf("expected entities to be decoded exactly once, got: %s", out)
+	}
+}

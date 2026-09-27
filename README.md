@@ -27,7 +27,7 @@ A lightweight, high-performance Multi-Account Email Manager and native **Model C
 | `search_emails` | Searches emails by keyword, sender, or subject across accounts | `query` *(required)*, `account`, `limit`, `folder` |
 | `read_email` | Retrieves full headers, recipients, and sanitized body for an email by ID | `account` *(required)*, `message_id` *(required)*, `folder`, `max_length` |
 | `list_folders` | Lists all available mailboxes/folders for an account (e.g. INBOX, Sent, Archive, Spam) | `account` *(required)* |
-| `send_email` | Transmits an email message via SMTP | `account` *(required)*, `to` *(required)*, `subject` *(required)*, `body` *(required)*, `is_html` |
+| `send_email` | Sends an email via SMTP (or Microsoft Graph for Graph accounts). Annotated as destructive so MCP clients can ask before sending | `account` *(required)*, `to` *(required)*, `subject` *(required)*, `body` *(required)*, `cc`, `bcc`, `is_html`, `in_reply_to` |
 
 ---
 
@@ -137,7 +137,7 @@ kgmail unread google --limit 5
 kgmail search "invoice"
 kgmail search "verification code" --account google --limit 3
 
-# Read an email by sequence ID
+# Read an email by ID (the IMAP UID shown by unread/search; stable across deletions)
 kgmail read google 197
 
 # List folders / mailboxes
@@ -145,6 +145,10 @@ kgmail folders google
 
 # Send an email via SMTP
 kgmail send --account google --to colleague@example.com --subject "Meeting update" --body "See you at 3 PM."
+
+# Send with Cc/Bcc, or as a threaded reply (SMTP accounts)
+kgmail send --account google --to a@example.com --cc b@example.com --bcc c@example.com --subject "Hi" --body "Hello"
+kgmail send --account google --to a@example.com --subject "Re: Hi" --body "Thanks!" --in-reply-to "<original-message-id@example.com>"
 
 # Add or update an account via CLI
 kgmail add-account work --provider gmail --user user@company.com --password <token>
