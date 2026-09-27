@@ -16,6 +16,7 @@ import (
 
 const (
 	defaultMicrosoftScope = "https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send offline_access"
+	graphDelegatedScope   = "https://graph.microsoft.com/.default offline_access"
 )
 
 // xoauth2Client implements sasl.Client for IMAP XOAUTH2 authentication.
@@ -82,47 +83,74 @@ type microsoftDeviceCodeResponse struct {
 	ErrorDesc       string `json:"error_description"`
 }
 
+// microsoftScopes returns the delegated (refresh/device-code) and app-only
+// (client-credentials) scopes for the API the account talks to. IMAP/SMTP and
+// Microsoft Graph tokens have different audiences and are not interchangeable.
+func microsoftScopes(cfg *AccountConfig) (delegated, appOnly string) {
+	if cfg.IsGraph() {
+		return graphDelegatedScope, "https://graph.microsoft.com/.default"
+	}
+	return defaultMicrosoftScope, "https://outlook.office365.com/.default"
+}
+
 // GetOrRefreshMicrosoftToken returns a valid access token for the given account,
 // refreshing it via Microsoft Identity Platform if it is expired or expiring soon.
+// Refreshed tokens are persisted to the config entry named by cfg.Name.
 func GetOrRefreshMicrosoftToken(cfg *AccountConfig) (string, error) {
 	// If cached token is still valid (with 2 minute safety margin), use it
 	if cfg.AccessToken != "" && cfg.TokenExpiry > time.Now().Unix()+120 {
 		return cfg.AccessToken, nil
 	}
 
+	delegatedScope, appOnlyScope := microsoftScopes(cfg)
+
 	// Try refresh token if available
 	if cfg.RefreshToken != "" {
-		token, err := refreshMicrosoftToken(cfg)
+		form := url.Values{}
+		form.Set("grant_type", "refresh_token")
+		form.Set("refresh_token", cfg.RefreshToken)
+		form.Set("scope", delegatedScope)
+		tr, err := requestMicrosoftToken(cfg, tenantOrDefault(cfg.TenantID, "common"), form)
 		if err == nil {
-			return token, nil
+			storeMicrosoftToken(cfg, tr)
+			return cfg.AccessToken, nil
 		}
 		// If refresh failed and we have no secret, report the error
 		if cfg.ClientSecret == "" {
-			return "", fmt.Errorf("failed to refresh token (%v); please re-authenticate with 'kgmail auth-microsoft'", err)
+			return "", fmt.Errorf("failed to refresh token (%v); please re-authenticate with 'kgmail auth-microsoft %s'", err, cfg.Name)
 		}
 	}
 
 	// Try client credentials if client_secret is present
 	if cfg.ClientSecret != "" {
-		return clientCredentialsMicrosoftToken(cfg)
+		form := url.Values{}
+		form.Set("grant_type", "client_credentials")
+		form.Set("scope", appOnlyScope)
+		tr, err := requestMicrosoftToken(cfg, tenantOrDefault(cfg.TenantID, "organizations"), form)
+		if err != nil {
+			return "", fmt.Errorf("client credentials: %w", err)
+		}
+		// Client-credential responses carry no refresh token
+		tr.RefreshToken = ""
+		storeMicrosoftToken(cfg, tr)
+		return cfg.AccessToken, nil
 	}
 
-	return "", fmt.Errorf("account %s requires Microsoft OAuth2 authentication. Run 'kgmail auth-microsoft <account>' to sign in", cfg.Username)
+	return "", fmt.Errorf("account %s requires Microsoft OAuth2 authentication. Run 'kgmail auth-microsoft %s' to sign in", cfg.Username, cfg.Name)
 }
 
-func refreshMicrosoftToken(cfg *AccountConfig) (string, error) {
-	tenant := cfg.TenantID
+func tenantOrDefault(tenant, def string) string {
 	if tenant == "" {
-		tenant = "common"
+		return def
 	}
+	return tenant
+}
 
-	endpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant)
+// requestMicrosoftToken posts form (plus client_id/client_secret) to the tenant's token endpoint.
+func requestMicrosoftToken(cfg *AccountConfig, tenant string, form url.Values) (*microsoftTokenResponse, error) {
+	endpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", url.PathEscape(tenant))
 
-	form := url.Values{}
 	form.Set("client_id", cfg.ClientID)
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", cfg.RefreshToken)
-	form.Set("scope", defaultMicrosoftScope)
 	if cfg.ClientSecret != "" {
 		form.Set("client_secret", cfg.ClientSecret)
 	}
@@ -130,85 +158,44 @@ func refreshMicrosoftToken(cfg *AccountConfig) (string, error) {
 	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.PostForm(endpoint, form)
 	if err != nil {
-		return "", fmt.Errorf("HTTP request to Microsoft token endpoint failed: %w", err)
+		return nil, fmt.Errorf("HTTP request to Microsoft token endpoint failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	var tr microsoftTokenResponse
 	if err := json.Unmarshal(bodyBytes, &tr); err != nil {
-		return "", fmt.Errorf("failed to parse token response: %w", err)
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Microsoft token error [%s]: %s", tr.Error, tr.ErrorDesc)
+		return nil, fmt.Errorf("Microsoft token error [%s]: %s", tr.Error, tr.ErrorDesc)
 	}
 
 	if tr.AccessToken == "" {
-		return "", fmt.Errorf("received empty access token from Microsoft")
+		return nil, fmt.Errorf("received empty access token from Microsoft")
 	}
 
+	return &tr, nil
+}
+
+// storeMicrosoftToken updates cfg with tr and persists it to the config file.
+func storeMicrosoftToken(cfg *AccountConfig, tr *microsoftTokenResponse) {
 	cfg.AccessToken = tr.AccessToken
 	if tr.RefreshToken != "" {
 		cfg.RefreshToken = tr.RefreshToken
 	}
 	cfg.TokenExpiry = time.Now().Unix() + tr.ExpiresIn
 
-	// Persist refreshed tokens to configuration file
-	_ = UpdateAccountTokens(cfg.Username, cfg.AccessToken, cfg.RefreshToken, cfg.TokenExpiry)
-
-	return cfg.AccessToken, nil
-}
-
-func clientCredentialsMicrosoftToken(cfg *AccountConfig) (string, error) {
-	tenant := cfg.TenantID
-	if tenant == "" {
-		tenant = "organizations"
+	// Microsoft rotates refresh tokens, so a failed save is worth surfacing.
+	// Stderr is safe here: stdout carries the MCP protocol.
+	if err := UpdateAccountTokens(cfg.Name, cfg.AccessToken, cfg.RefreshToken, cfg.TokenExpiry); err != nil {
+		fmt.Fprintf(os.Stderr, "kgmail: warning: failed to persist refreshed tokens for %s: %v\n", cfg.Name, err)
 	}
-
-	endpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant)
-
-	form := url.Values{}
-	form.Set("client_id", cfg.ClientID)
-	form.Set("client_secret", cfg.ClientSecret)
-	form.Set("grant_type", "client_credentials")
-	form.Set("scope", "https://outlook.office365.com/.default")
-
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.PostForm(endpoint, form)
-	if err != nil {
-		return "", fmt.Errorf("HTTP request to Microsoft token endpoint failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var tr microsoftTokenResponse
-	if err := json.Unmarshal(bodyBytes, &tr); err != nil {
-		return "", fmt.Errorf("failed to parse token response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Microsoft client credentials token error [%s]: %s", tr.Error, tr.ErrorDesc)
-	}
-
-	if tr.AccessToken == "" {
-		return "", fmt.Errorf("received empty access token from Microsoft")
-	}
-
-	cfg.AccessToken = tr.AccessToken
-	cfg.TokenExpiry = time.Now().Unix() + tr.ExpiresIn
-
-	_ = UpdateAccountTokens(cfg.Username, cfg.AccessToken, "", cfg.TokenExpiry)
-
-	return cfg.AccessToken, nil
 }
 
 // MicrosoftDeviceCodeFlow guides the user through device code authorization in their browser.
@@ -216,18 +203,20 @@ func MicrosoftDeviceCodeFlow(accountName string, cfg *AccountConfig) error {
 	if cfg.ClientID == "" {
 		return fmt.Errorf("client_id is required for Microsoft OAuth2. Set client_id in configuration")
 	}
+	cfg.Name = accountName
 
 	tenant := cfg.TenantID
 	if tenant == "" {
 		tenant = "common"
 	}
 
-	deviceEndpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/devicecode", tenant)
-	tokenEndpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant)
+	deviceEndpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/devicecode", url.PathEscape(tenant))
+	tokenEndpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", url.PathEscape(tenant))
 
+	scope, _ := microsoftScopes(cfg)
 	form := url.Values{}
 	form.Set("client_id", cfg.ClientID)
-	form.Set("scope", defaultMicrosoftScope)
+	form.Set("scope", scope)
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.PostForm(deviceEndpoint, form)
@@ -330,11 +319,11 @@ func MicrosoftDeviceCodeFlow(accountName string, cfg *AccountConfig) error {
 				fmt.Println("💾 Tokens successfully persisted to config.")
 			}
 
-			fmt.Println("Testing IMAP connection to outlook.office365.com...")
+			fmt.Println("Testing connection...")
 			if testErr := TestConnection(*cfg); testErr != nil {
 				fmt.Fprintf(os.Stderr, "⚠️ Note: Connection test returned: %v\n", testErr)
 			} else {
-				fmt.Println("✅ Connected and authenticated successfully via XOAUTH2!")
+				fmt.Println("✅ Connected and authenticated successfully!")
 			}
 
 			return nil

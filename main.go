@@ -25,7 +25,7 @@ COMMANDS:
   search <query>                Search emails across accounts by keyword
   read <account> <id>           Read full email content and headers by ID
   folders <account>             List all mailboxes/folders for an account
-  send                          Send an email via SMTP
+  send                          Send an email (SMTP or Microsoft Graph)
   add-account <name>            Add or update an email account
   remove-account <name>         Remove an email account
   auth-microsoft <name>         Authorize Microsoft 365 account via browser (device-code)
@@ -49,6 +49,10 @@ EXAMPLES:
 
   # Read an email:
   kgmail read google 1234
+
+  # Send an email (optionally as a threaded reply):
+  kgmail send --account google --to a@x.com --cc b@x.com --subject "Hi" --body "Hello"
+  kgmail send --account google --to a@x.com --subject "Re: Hi" --body "Thanks" --in-reply-to "<id@x.com>"
 
   # Add an account with password / app password:
   kgmail add-account personal --provider gmail --user myemail@gmail.com --password <token>
@@ -112,7 +116,8 @@ func main() {
 		}
 		fmt.Printf("Config File: %s\n", path)
 		fmt.Printf("Configured Accounts (%d):\n", len(cfg.Accounts))
-		for name, acc := range cfg.Accounts {
+		for _, name := range SortedAccountNames(cfg) {
+			acc := cfg.Accounts[name]
 			en := "enabled"
 			if acc.Enabled != nil && !*acc.Enabled {
 				en = "disabled"
@@ -154,19 +159,23 @@ func runListAccounts() {
 	fmt.Printf("%-15s %-10s %-30s %-25s %s\n", "ACCOUNT", "PROVIDER", "USER", "IMAP HOST", "STATUS")
 	fmt.Println(strings.Repeat("-", 95))
 
-	for name, acc := range cfg.Accounts {
-		enabled := acc.Enabled == nil || *acc.Enabled
-		if !enabled {
-			fmt.Printf("%-15s %-10s %-30s %-25s %s\n", name, acc.Provider, acc.Username, fmt.Sprintf("%s:%d", acc.Host, acc.Port), "⏸️ Disabled")
-			continue
+	results := forEachAccount(cfg, SortedAccountNames(cfg), func(name string, acc AccountConfig) (bool, error) {
+		if acc.Enabled != nil && !*acc.Enabled {
+			return false, nil
 		}
+		return true, TestConnection(acc)
+	})
 
-		testErr := TestConnection(acc)
+	for _, res := range results {
+		acc := cfg.Accounts[res.Name]
 		status := "✅ Connected"
-		if testErr != nil {
-			status = fmt.Sprintf("❌ Error: %v", testErr)
+		switch {
+		case !res.Value:
+			status = "⏸️ Disabled"
+		case res.Err != nil:
+			status = fmt.Sprintf("❌ Error: %v", res.Err)
 		}
-		fmt.Printf("%-15s %-10s %-30s %-25s %s\n", name, acc.Provider, acc.Username, fmt.Sprintf("%s:%d", acc.Host, acc.Port), status)
+		fmt.Printf("%-15s %-10s %-30s %-25s %s\n", res.Name, acc.Provider, acc.Username, fmt.Sprintf("%s:%d", acc.Host, acc.Port), status)
 	}
 }
 
@@ -189,45 +198,29 @@ func runUnread() {
 		os.Exit(1)
 	}
 
-	targets := make(map[string]AccountConfig)
-	if strings.ToLower(accountName) == "all" {
-		for name, acc := range cfg.Accounts {
-			if acc.Enabled == nil || *acc.Enabled {
-				targets[name] = acc
-			}
-		}
-	} else {
-		acc, ok := cfg.Accounts[accountName]
-		if !ok {
-			fmt.Fprintf(os.Stderr, "Account '%s' not found.\n", accountName)
-			os.Exit(1)
-		}
-		targets[accountName] = acc
+	names, err := ResolveTargets(cfg, accountName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 
+	results := forEachAccount(cfg, names, func(name string, acc AccountConfig) ([]EmailSummary, error) {
+		return GetUnreadEmails(name, acc, *folder, *limit)
+	})
+
 	total := 0
-	for name, acc := range targets {
-		fmt.Printf("📬 Checking unread for [%s] (%s)...\n", name, *folder)
-		summaries, err := GetUnreadEmails(name, acc, *folder, *limit)
-		if err != nil {
-			fmt.Printf("  ❌ Error: %v\n\n", err)
+	for _, res := range results {
+		fmt.Printf("📬 Unread for [%s] (%s):\n", res.Name, *folder)
+		if res.Err != nil {
+			fmt.Printf("  ❌ Error: %v\n\n", res.Err)
 			continue
 		}
-
-		if len(summaries) == 0 {
+		if len(res.Value) == 0 {
 			fmt.Printf("  No unread emails in %s.\n\n", *folder)
 			continue
 		}
-
-		total += len(summaries)
-		for _, s := range summaries {
-			fmt.Printf("  • [ID: %s] %s | %s\n", s.ID, s.Date.Format("02 Jan 15:04"), s.From)
-			fmt.Printf("    Subject: %s\n", s.Subject)
-			if s.Snippet != "" {
-				fmt.Printf("    Snippet: %s\n", s.Snippet)
-			}
-			fmt.Println()
-		}
+		total += len(res.Value)
+		printSummaries(res.Value)
 	}
 
 	if total == 0 {
@@ -254,50 +247,55 @@ func runSearch() {
 		os.Exit(1)
 	}
 
-	targets := make(map[string]AccountConfig)
-	if strings.ToLower(*account) == "all" {
-		for name, acc := range cfg.Accounts {
-			if acc.Enabled == nil || *acc.Enabled {
-				targets[name] = acc
-			}
-		}
-	} else {
-		acc, ok := cfg.Accounts[*account]
-		if !ok {
-			fmt.Fprintf(os.Stderr, "Account '%s' not found.\n", *account)
-			os.Exit(1)
-		}
-		targets[*account] = acc
+	names, err := ResolveTargets(cfg, *account)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 
+	results := forEachAccount(cfg, names, func(name string, acc AccountConfig) ([]EmailSummary, error) {
+		return SearchEmails(name, acc, query, *folder, *limit)
+	})
+
 	total := 0
-	for name, acc := range targets {
-		fmt.Printf("🔍 Searching [%s] for '%s'...\n", name, query)
-		summaries, err := SearchEmails(name, acc, query, *folder, *limit)
-		if err != nil {
-			fmt.Printf("  ❌ Search error: %v\n\n", err)
+	for _, res := range results {
+		fmt.Printf("🔍 Results in [%s] for '%s':\n", res.Name, query)
+		if res.Err != nil {
+			fmt.Printf("  ❌ Search error: %v\n\n", res.Err)
 			continue
 		}
-
-		if len(summaries) == 0 {
+		if len(res.Value) == 0 {
 			fmt.Printf("  No matching emails in %s.\n\n", *folder)
 			continue
 		}
-
-		total += len(summaries)
-		for _, s := range summaries {
-			fmt.Printf("  • [ID: %s] %s | %s\n", s.ID, s.Date.Format("02 Jan 15:04"), s.From)
-			fmt.Printf("    Subject: %s\n", s.Subject)
-			if s.Snippet != "" {
-				fmt.Printf("    Snippet: %s\n", s.Snippet)
-			}
-			fmt.Println()
-		}
+		total += len(res.Value)
+		printSummaries(res.Value)
 	}
 
 	if total == 0 {
 		fmt.Println("No matches found.")
 	}
+}
+
+func printSummaries(summaries []EmailSummary) {
+	for _, s := range summaries {
+		fmt.Printf("  • [ID: %s] %s | %s\n", s.ID, s.Date.Format("02 Jan 15:04"), s.From)
+		fmt.Printf("    Subject: %s\n", s.Subject)
+		if s.Snippet != "" {
+			fmt.Printf("    Snippet: %s\n", s.Snippet)
+		}
+		fmt.Println()
+	}
+}
+
+func splitAddressList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func runRead() {
@@ -383,14 +381,17 @@ func runFolders() {
 func runSend() {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	account := fs.String("account", "", "Account name to send from")
-	to := fs.String("to", "", "Recipient email address")
+	to := fs.String("to", "", "Recipient email address(es), comma-separated")
+	cc := fs.String("cc", "", "Cc recipient(s), comma-separated")
+	bcc := fs.String("bcc", "", "Bcc recipient(s), comma-separated")
 	subject := fs.String("subject", "", "Email subject")
 	body := fs.String("body", "", "Email body text")
 	isHTML := fs.Bool("html", false, "Body is HTML")
+	inReplyTo := fs.String("in-reply-to", "", "Message-ID of the email being replied to (threads the reply)")
 	fs.Parse(os.Args[2:])
 
 	if *account == "" || *to == "" || *subject == "" || *body == "" {
-		fmt.Println("Usage: kgmail send --account <acc> --to <recipient> --subject <subj> --body <body> [--html]")
+		fmt.Println("Usage: kgmail send --account <acc> --to <recipient> --subject <subj> --body <body> [--cc <addrs>] [--bcc <addrs>] [--in-reply-to <message-id>] [--html]")
 		os.Exit(1)
 	}
 
@@ -406,12 +407,17 @@ func runSend() {
 		os.Exit(1)
 	}
 
-	recipients := strings.Split(*to, ",")
-	for i := range recipients {
-		recipients[i] = strings.TrimSpace(recipients[i])
+	msg := OutgoingEmail{
+		To:        splitAddressList(*to),
+		Cc:        splitAddressList(*cc),
+		Bcc:       splitAddressList(*bcc),
+		Subject:   *subject,
+		Body:      *body,
+		IsHTML:    *isHTML,
+		InReplyTo: *inReplyTo,
 	}
 
-	if err := SendEmail(acc, recipients, *subject, *body, *isHTML); err != nil {
+	if err := SendEmail(acc, msg); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to send email: %v\n", err)
 		os.Exit(1)
 	}
@@ -469,6 +475,7 @@ func runAddAccount() {
 	}
 
 	acc = normalizeAccount(acc)
+	acc.Name = name
 
 	if acc.IsOAuth2() && acc.AccessToken == "" && acc.RefreshToken == "" && acc.ClientSecret == "" {
 		// Save the account configuration skeleton first

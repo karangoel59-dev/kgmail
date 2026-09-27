@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -137,5 +138,63 @@ func TestOAuth2ConfigAndTokens(t *testing.T) {
 	}
 	if m365Acc.TokenExpiry != 1899999999 {
 		t.Errorf("expected token expiry 1899999999, got: %d", m365Acc.TokenExpiry)
+	}
+}
+
+func TestUpdateAccountTokens_SharedUsername(t *testing.T) {
+	tmpConfig := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("KGMAIL_CONFIG", tmpConfig)
+
+	// Two accounts for the same mailbox (e.g. IMAP OAuth and Graph)
+	cfg := &Config{Accounts: map[string]AccountConfig{
+		"imap":  {Provider: "office365", Username: "me@corp.com", ClientID: "c", TenantID: "t"},
+		"graph": {Provider: "graph", Username: "me@corp.com", ClientID: "c", TenantID: "t"},
+	}}
+	if err := SaveConfig(cfg, tmpConfig); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		if err := UpdateAccountTokens("graph", "graph-token", "", 1899999999); err != nil {
+			t.Fatalf("UpdateAccountTokens: %v", err)
+		}
+	}
+
+	loaded, _, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := loaded.Accounts["imap"].AccessToken; got != "" {
+		t.Errorf("imap account received another account's token: %q", got)
+	}
+	if got := loaded.Accounts["graph"].AccessToken; got != "graph-token" {
+		t.Errorf("graph account token = %q", got)
+	}
+	if loaded.Accounts["graph"].Name != "graph" {
+		t.Errorf("expected LoadConfig to populate Name")
+	}
+
+	info, err := os.Stat(tmpConfig)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("config permissions = %o, want 600", perm)
+	}
+}
+
+func TestResolveTargets(t *testing.T) {
+	disabled := false
+	cfg := &Config{Accounts: map[string]AccountConfig{
+		"b":   {},
+		"a":   {},
+		"off": {Enabled: &disabled},
+	}}
+	names, err := ResolveTargets(cfg, "all")
+	if err != nil || strings.Join(names, ",") != "a,b" {
+		t.Errorf("ResolveTargets(all) = %v, %v", names, err)
+	}
+	if _, err := ResolveTargets(cfg, "missing"); err == nil {
+		t.Errorf("expected error for unknown account")
 	}
 }

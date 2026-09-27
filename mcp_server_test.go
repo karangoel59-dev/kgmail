@@ -10,19 +10,34 @@ func TestBuildMCPServer(t *testing.T) {
 		t.Fatalf("expected non-nil MCP server")
 	}
 
-	expectedTools := []string{
-		"list_accounts",
-		"get_unread_emails",
-		"search_emails",
-		"read_email",
-		"list_folders",
-		"send_email",
+	tools := s.ListTools()
+	readOnly := []string{"list_accounts", "get_unread_emails", "search_emails", "read_email", "list_folders"}
+	for _, name := range readOnly {
+		tool, ok := tools[name]
+		if !ok {
+			t.Fatalf("tool %s not registered", name)
+		}
+		if h := tool.Tool.Annotations.ReadOnlyHint; h == nil || !*h {
+			t.Errorf("expected %s to be annotated read-only", name)
+		}
+		if h := tool.Tool.Annotations.DestructiveHint; h == nil || *h {
+			t.Errorf("expected %s to be annotated non-destructive", name)
+		}
 	}
 
-	// Verify server initialization didn't panic and server object is constructed
-	for _, tool := range expectedTools {
-		if tool == "" {
-			t.Errorf("empty tool name")
+	send, ok := tools["send_email"]
+	if !ok {
+		t.Fatalf("tool send_email not registered")
+	}
+	if h := send.Tool.Annotations.DestructiveHint; h == nil || !*h {
+		t.Errorf("expected send_email to be annotated destructive")
+	}
+	if h := send.Tool.Annotations.ReadOnlyHint; h == nil || *h {
+		t.Errorf("expected send_email not to be read-only")
+	}
+	for _, param := range []string{"cc", "bcc", "in_reply_to"} {
+		if _, ok := send.Tool.InputSchema.Properties[param]; !ok {
+			t.Errorf("expected send_email to accept %s", param)
 		}
 	}
 }

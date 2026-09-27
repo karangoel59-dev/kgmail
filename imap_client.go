@@ -1,23 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
-	"github.com/emersion/go-message/mail"
 )
 
-const (
-	defaultTimeout   = 10 * time.Second
-	defaultMaxBodyLen = 10000
-)
+const defaultTimeout = 10 * time.Second
 
 // DialIMAP connects and logs into an IMAP server according to AccountConfig.
 func DialIMAP(cfg AccountConfig, timeout time.Duration) (*client.Client, error) {
@@ -38,7 +36,7 @@ func DialIMAP(cfg AccountConfig, timeout time.Duration) (*client.Client, error) 
 		return nil, fmt.Errorf("account has no password and is not configured for OAuth2 (set tenant_id + client_id)")
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	tlsConfig := &tls.Config{
 		ServerName: host,
 		MinVersion: tls.VersionTLS12,
@@ -143,6 +141,19 @@ func ListFolders(cfg AccountConfig) ([]string, error) {
 	return folders, nil
 }
 
+// newestUIDs sorts uids ascending and returns the newest limit of them, newest first.
+func newestUIDs(uids []uint32, limit int) []uint32 {
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	if len(uids) > limit {
+		uids = uids[len(uids)-limit:]
+	}
+	out := make([]uint32, len(uids))
+	for i, uid := range uids {
+		out[len(uids)-1-i] = uid
+	}
+	return out
+}
+
 // GetUnreadEmails retrieves recent unread emails without marking them as read.
 func GetUnreadEmails(accountName string, cfg AccountConfig, folder string, limit int) ([]EmailSummary, error) {
 	if cfg.IsGraph() {
@@ -152,9 +163,7 @@ func GetUnreadEmails(accountName string, cfg AccountConfig, folder string, limit
 	if folder == "" {
 		folder = "INBOX"
 	}
-	if limit <= 0 {
-		limit = 10
-	}
+	limit = clampLimit(limit)
 
 	c, err := DialIMAP(cfg, 15*time.Second)
 	if err != nil {
@@ -163,36 +172,19 @@ func GetUnreadEmails(accountName string, cfg AccountConfig, folder string, limit
 	defer c.Logout()
 
 	// Select folder in ReadOnly mode so server doesn't mutate message flags
-	_, err = c.Select(folder, true)
-	if err != nil {
+	if _, err = c.Select(folder, true); err != nil {
 		return nil, fmt.Errorf("failed to select folder %s: %w", folder, err)
 	}
 
 	criteria := imap.NewSearchCriteria()
 	criteria.WithoutFlags = []string{imap.SeenFlag}
 
-	ids, err := c.Search(criteria)
+	uids, err := c.UidSearch(criteria)
 	if err != nil {
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
-	if len(ids) == 0 {
-		return []EmailSummary{}, nil
-	}
-
-	// Slice most recent IDs
-	startIdx := 0
-	if len(ids) > limit {
-		startIdx = len(ids) - limit
-	}
-	targetIDs := ids[startIdx:]
-
-	// Reverse so newest appears first
-	for i, j := 0, len(targetIDs)-1; i < j; i, j = i+1, j-1 {
-		targetIDs[i], targetIDs[j] = targetIDs[j], targetIDs[i]
-	}
-
-	return fetchSummaries(c, accountName, targetIDs)
+	return fetchSummaries(c, accountName, newestUIDs(uids, limit))
 }
 
 // SearchEmails searches for emails matching query in ReadOnly mode.
@@ -204,9 +196,7 @@ func SearchEmails(accountName string, cfg AccountConfig, query string, folder st
 	if folder == "" {
 		folder = "INBOX"
 	}
-	if limit <= 0 {
-		limit = 10
-	}
+	limit = clampLimit(limit)
 
 	c, err := DialIMAP(cfg, 15*time.Second)
 	if err != nil {
@@ -214,66 +204,52 @@ func SearchEmails(accountName string, cfg AccountConfig, query string, folder st
 	}
 	defer c.Logout()
 
-	_, err = c.Select(folder, true)
-	if err != nil {
+	if _, err = c.Select(folder, true); err != nil {
 		return nil, fmt.Errorf("failed to select folder %s: %w", folder, err)
 	}
 
 	// 1. Try search with TEXT
 	criteria := imap.NewSearchCriteria()
 	criteria.Text = []string{query}
-	ids, err := c.Search(criteria)
+	uids, err := c.UidSearch(criteria)
 
-	// Fallback to searching header fields if TEXT search fails or returns nothing
-	if err != nil || len(ids) == 0 {
-		fallback1 := imap.NewSearchCriteria()
-		fallback1.Header.Add("Subject", query)
-		ids1, err1 := c.Search(fallback1)
-
-		fallback2 := imap.NewSearchCriteria()
-		fallback2.Header.Add("From", query)
-		ids2, err2 := c.Search(fallback2)
-
-		if err1 == nil && len(ids1) > 0 {
-			ids = ids1
-		} else if err2 == nil && len(ids2) > 0 {
-			ids = ids2
+	// Fall back to the union of Subject and From matches if TEXT search fails or finds nothing
+	if err != nil || len(uids) == 0 {
+		seen := make(map[uint32]bool)
+		uids = nil
+		for _, field := range []string{"Subject", "From"} {
+			fallback := imap.NewSearchCriteria()
+			fallback.Header.Add(field, query)
+			found, ferr := c.UidSearch(fallback)
+			if ferr != nil {
+				continue
+			}
+			for _, uid := range found {
+				if !seen[uid] {
+					seen[uid] = true
+					uids = append(uids, uid)
+				}
+			}
 		}
 	}
 
-	if len(ids) == 0 {
+	return fetchSummaries(c, accountName, newestUIDs(uids, limit))
+}
+
+// fetchSummaries fetches envelopes and snippets for uids, returned in the same order as uids.
+func fetchSummaries(c *client.Client, accountName string, uids []uint32) ([]EmailSummary, error) {
+	if len(uids) == 0 {
 		return []EmailSummary{}, nil
 	}
 
-	// Slice most recent IDs
-	startIdx := 0
-	if len(ids) > limit {
-		startIdx = len(ids) - limit
-	}
-	targetIDs := ids[startIdx:]
-
-	// Reverse for newest first
-	for i, j := 0, len(targetIDs)-1; i < j; i, j = i+1, j-1 {
-		targetIDs[i], targetIDs[j] = targetIDs[j], targetIDs[i]
-	}
-
-	return fetchSummaries(c, accountName, targetIDs)
-}
-
-func fetchSummaries(c *client.Client, accountName string, ids []uint32) ([]EmailSummary, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
 	seqset := new(imap.SeqSet)
-	seqset.AddNum(ids...)
+	seqset.AddNum(uids...)
 
-	// Fetch envelope, UID, internal date, and body snippet using BODY.PEEK[TEXT]
+	// Fetch only the first few KB of each message (BODY.PEEK[]<0.N>): enough to
+	// decode the start of the text part without downloading attachments.
 	section := &imap.BodySectionName{
-		BodyPartName: imap.BodyPartName{
-			Specifier: imap.TextSpecifier,
-		},
-		Peek: true,
+		Peek:    true,
+		Partial: []int{0, snippetFetchBytes},
 	}
 
 	items := []imap.FetchItem{
@@ -283,31 +259,26 @@ func fetchSummaries(c *client.Client, accountName string, ids []uint32) ([]Email
 		section.FetchItem(),
 	}
 
-	messages := make(chan *imap.Message, len(ids))
+	messages := make(chan *imap.Message, len(uids))
 	done := make(chan error, 1)
 	go func() {
-		done <- c.Fetch(seqset, items, messages)
+		done <- c.UidFetch(seqset, items, messages)
 	}()
 
-	var summaries []EmailSummary
+	byUID := make(map[uint32]EmailSummary, len(uids))
+	var retry []uint32
 	for msg := range messages {
 		summary := EmailSummary{
 			Account: accountName,
-			ID:      fmt.Sprintf("%d", msg.SeqNum),
+			ID:      strconv.FormatUint(uint64(msg.Uid), 10),
 		}
 
 		if msg.Envelope != nil {
 			summary.Subject = msg.Envelope.Subject
 			summary.Date = msg.Envelope.Date
 			summary.MessageID = msg.Envelope.MessageId
-
 			if len(msg.Envelope.From) > 0 {
-				from := msg.Envelope.From[0]
-				if from.PersonalName != "" {
-					summary.From = fmt.Sprintf("%s <%s@%s>", from.PersonalName, from.MailboxName, from.HostName)
-				} else {
-					summary.From = fmt.Sprintf("%s@%s", from.MailboxName, from.HostName)
-				}
+				summary.From = formatAddress(msg.Envelope.From[0])
 			}
 		}
 
@@ -315,28 +286,75 @@ func fetchSummaries(c *client.Client, accountName string, ids []uint32) ([]Email
 			summary.Date = msg.InternalDate
 		}
 
-		// Extract snippet from body
 		for _, literal := range msg.Body {
 			if literal != nil {
-				snippet := extractSnippet(literal, 180)
-				if snippet != "" {
-					summary.Snippet = snippet
-					break
+				raw, _ := io.ReadAll(literal)
+				summary.Snippet = extractSnippet(bytes.NewReader(raw), snippetLen)
+				// Cut off before any readable text (e.g. a large CSS block): retry with more bytes
+				if summary.Snippet == "" && len(raw) >= snippetFetchBytes {
+					retry = append(retry, msg.Uid)
 				}
+				break
 			}
 		}
 
-		summaries = append(summaries, summary)
+		byUID[msg.Uid] = summary
 	}
 
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("failed to fetch messages: %w", err)
 	}
 
+	if len(retry) > 0 {
+		// Snippets are best-effort; keep the summaries even if the retry fails
+		if snippets, err := fetchSnippets(c, retry, snippetRetryBytes); err == nil {
+			for uid, snippet := range snippets {
+				if s, ok := byUID[uid]; ok {
+					s.Snippet = snippet
+					byUID[uid] = s
+				}
+			}
+		}
+	}
+
+	// The server returns messages in mailbox order; restore the requested (newest-first) order
+	summaries := make([]EmailSummary, 0, len(byUID))
+	for _, uid := range uids {
+		if s, ok := byUID[uid]; ok {
+			summaries = append(summaries, s)
+		}
+	}
 	return summaries, nil
 }
 
-// ReadEmail fetches and parses the full email message for a given ID.
+// fetchSnippets fetches the first n bytes of each message and returns their decoded snippets by UID.
+func fetchSnippets(c *client.Client, uids []uint32, n int) (map[uint32]string, error) {
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uids...)
+	section := &imap.BodySectionName{Peek: true, Partial: []int{0, n}}
+
+	messages := make(chan *imap.Message, len(uids))
+	done := make(chan error, 1)
+	go func() {
+		done <- c.UidFetch(seqset, []imap.FetchItem{imap.FetchUid, section.FetchItem()}, messages)
+	}()
+
+	snippets := make(map[uint32]string, len(uids))
+	for msg := range messages {
+		for _, literal := range msg.Body {
+			if literal != nil {
+				snippets[msg.Uid] = extractSnippet(literal, snippetLen)
+				break
+			}
+		}
+	}
+	if err := <-done; err != nil {
+		return nil, err
+	}
+	return snippets, nil
+}
+
+// ReadEmail fetches and parses the full email message for a given ID (an IMAP UID).
 func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, maxBodyLen int) (*EmailDetail, error) {
 	if cfg.IsGraph() {
 		return ReadEmailGraph(accountName, cfg, id, maxBodyLen)
@@ -349,9 +367,9 @@ func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, 
 		maxBodyLen = defaultMaxBodyLen
 	}
 
-	numID, parseErr := strconv.ParseUint(id, 10, 32)
-	if parseErr != nil {
-		return nil, fmt.Errorf("invalid message ID '%s' for IMAP: must be numeric sequence number", id)
+	uid, parseErr := strconv.ParseUint(id, 10, 32)
+	if parseErr != nil || uid == 0 {
+		return nil, fmt.Errorf("invalid message ID '%s' for IMAP: must be a numeric UID", id)
 	}
 
 	c, err := DialIMAP(cfg, 20*time.Second)
@@ -361,13 +379,12 @@ func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, 
 	defer c.Logout()
 
 	// Select folder in ReadOnly mode
-	_, err = c.Select(folder, true)
-	if err != nil {
+	if _, err = c.Select(folder, true); err != nil {
 		return nil, fmt.Errorf("failed to select folder %s: %w", folder, err)
 	}
 
 	seqset := new(imap.SeqSet)
-	seqset.AddNum(uint32(numID))
+	seqset.AddNum(uint32(uid))
 
 	// Request entire RFC822 message via BODY.PEEK[] so unread flag is preserved
 	section := &imap.BodySectionName{Peek: true}
@@ -381,7 +398,7 @@ func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, 
 	messages := make(chan *imap.Message, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- c.Fetch(seqset, items, messages)
+		done <- c.UidFetch(seqset, items, messages)
 	}()
 
 	msg := <-messages
@@ -395,7 +412,7 @@ func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, 
 
 	detail := &EmailDetail{
 		Account: accountName,
-		ID:      fmt.Sprintf("%d", msg.SeqNum),
+		ID:      strconv.FormatUint(uint64(msg.Uid), 10),
 		Headers: make(map[string]string),
 	}
 
@@ -405,10 +422,8 @@ func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, 
 		detail.MessageID = msg.Envelope.MessageId
 
 		if len(msg.Envelope.From) > 0 {
-			f := msg.Envelope.From[0]
-			detail.From = formatAddress(f)
+			detail.From = formatAddress(msg.Envelope.From[0])
 		}
-
 		for _, to := range msg.Envelope.To {
 			detail.To = append(detail.To, formatAddress(to))
 		}
@@ -421,25 +436,26 @@ func ReadEmail(accountName string, cfg AccountConfig, id string, folder string, 
 		detail.Date = msg.InternalDate
 	}
 
-	// Parse full RFC822 literal
-	r := msg.GetBody(section)
-	if r != nil {
-		body, attachments, headers, parseErr := parseRFC822Message(r, maxBodyLen)
+	if r := msg.GetBody(section); r != nil {
+		raw, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read message %s: %w", id, err)
+		}
+
+		pm, parseErr := parseMIME(bytes.NewReader(raw))
 		if parseErr == nil {
-			detail.Body = body
-			detail.Attachments = attachments
-			if len(headers) > 0 {
-				detail.Headers = headers
+			detail.Body = truncateBody(pm.Text(), maxBodyLen)
+			detail.Attachments = pm.Attachments
+			if len(pm.Headers) > 0 {
+				detail.Headers = pm.Headers
 			}
 		} else {
-			// Fallback: raw read with HTML stripping
-			raw, _ := io.ReadAll(r)
+			// Fallback: raw message with HTML stripping
 			rawStr := string(raw)
 			if strings.Contains(strings.ToLower(rawStr), "<html") {
-				detail.Body = StripHTML(rawStr)
-			} else {
-				detail.Body = rawStr
+				rawStr = StripHTML(rawStr)
 			}
+			detail.Body = truncateBody(rawStr, maxBodyLen)
 		}
 	}
 
@@ -454,104 +470,4 @@ func formatAddress(a *imap.Address) string {
 		return fmt.Sprintf("%s <%s@%s>", a.PersonalName, a.MailboxName, a.HostName)
 	}
 	return fmt.Sprintf("%s@%s", a.MailboxName, a.HostName)
-}
-
-func parseRFC822Message(r io.Reader, maxLen int) (string, []string, map[string]string, error) {
-	mr, err := mail.CreateReader(r)
-	if err != nil {
-		return "", nil, nil, err
-	}
-
-	headers := make(map[string]string)
-	header := mr.Header
-	for key := range header.Map() {
-		headers[key] = header.Get(key)
-	}
-
-	var plainBody, htmlBody string
-	var attachments []string
-
-	for {
-		p, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			break
-		}
-
-		switch h := p.Header.(type) {
-		case *mail.InlineHeader:
-			contentType, _, _ := h.ContentType()
-			b, _ := io.ReadAll(p.Body)
-			content := string(b)
-
-			if strings.HasPrefix(contentType, "text/plain") && plainBody == "" {
-				plainBody = content
-			} else if strings.HasPrefix(contentType, "text/html") && htmlBody == "" {
-				htmlBody = StripHTML(content)
-			}
-		case *mail.AttachmentHeader:
-			filename, _ := h.Filename()
-			if filename != "" {
-				attachments = append(attachments, filename)
-			}
-		}
-	}
-
-	finalBody := plainBody
-	if finalBody == "" {
-		finalBody = htmlBody
-	}
-
-	finalBody = strings.TrimSpace(finalBody)
-	if len(finalBody) > maxLen {
-		finalBody = finalBody[:maxLen] + "\n...[truncated by kgmail]"
-	}
-
-	return finalBody, attachments, headers, nil
-}
-
-func extractSnippet(r io.Reader, maxLen int) string {
-	buf := make([]byte, 4096)
-	n, _ := r.Read(buf)
-	if n == 0 {
-		return ""
-	}
-	raw := string(buf[:n])
-	lines := strings.Split(raw, "\n")
-	var contentLines []string
-	inHeaders := false
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "--") {
-			inHeaders = true
-			continue
-		}
-		if inHeaders {
-			if trimmed == "" {
-				inHeaders = false
-			}
-			continue
-		}
-		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "content-type:") ||
-			strings.HasPrefix(lower, "content-transfer-encoding:") ||
-			strings.HasPrefix(lower, "content-disposition:") {
-			continue
-		}
-		if trimmed != "" {
-			contentLines = append(contentLines, trimmed)
-		}
-	}
-
-	text := strings.Join(contentLines, " ")
-	if strings.Contains(strings.ToLower(text), "<html") || strings.Contains(text, "<div") || strings.Contains(text, "<p") {
-		text = StripHTML(text)
-	}
-	text = strings.Join(strings.Fields(text), " ")
-	if len(text) > maxLen {
-		return text[:maxLen] + "..."
-	}
-	return text
 }

@@ -9,7 +9,11 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/emersion/go-message/mail"
 )
+
+const graphBaseURL = "https://graph.microsoft.com/v1.0"
 
 type graphFolderListResponse struct {
 	Value []struct {
@@ -23,7 +27,7 @@ type graphFolderListResponse struct {
 
 type graphRecipient struct {
 	EmailAddress struct {
-		Name    string `json:"name"`
+		Name    string `json:"name,omitempty"`
 		Address string `json:"address"`
 	} `json:"emailAddress"`
 }
@@ -62,65 +66,36 @@ type graphError struct {
 	Message string `json:"message"`
 }
 
-func getGraphAccessToken(cfg *AccountConfig) (string, error) {
-	if cfg.AccessToken != "" && cfg.TokenExpiry > time.Now().Unix()+120 {
-		return cfg.AccessToken, nil
-	}
+// graphWellKnownFolders maps common folder names (lowercased) to Graph well-known folder names.
+var graphWellKnownFolders = map[string]string{
+	"inbox":         "inbox",
+	"drafts":        "drafts",
+	"sent":          "sentitems",
+	"sent items":    "sentitems",
+	"sentitems":     "sentitems",
+	"deleted":       "deleteditems",
+	"deleted items": "deleteditems",
+	"deleteditems":  "deleteditems",
+	"trash":         "deleteditems",
+	"junk":          "junkemail",
+	"junk email":    "junkemail",
+	"junkemail":     "junkemail",
+	"spam":          "junkemail",
+	"archive":       "archive",
+	"outbox":        "outbox",
+}
 
-	tenant := cfg.TenantID
-	if tenant == "" {
-		tenant = "common"
-	}
+func graphUserURL(cfg AccountConfig) string {
+	return fmt.Sprintf("%s/users/%s", graphBaseURL, url.PathEscape(cfg.Username))
+}
 
-	endpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant)
-
-	form := url.Values{}
-	form.Set("client_id", cfg.ClientID)
-
-	if cfg.ClientSecret != "" && cfg.RefreshToken == "" {
-		form.Set("client_secret", cfg.ClientSecret)
-		form.Set("grant_type", "client_credentials")
-		form.Set("scope", "https://graph.microsoft.com/.default")
-	} else if cfg.RefreshToken != "" {
-		form.Set("grant_type", "refresh_token")
-		form.Set("refresh_token", cfg.RefreshToken)
-		form.Set("scope", "https://graph.microsoft.com/.default offline_access")
-		if cfg.ClientSecret != "" {
-			form.Set("client_secret", cfg.ClientSecret)
-		}
-	} else {
-		return "", fmt.Errorf("account %s requires authorization; run 'kgmail auth-microsoft <account>'", cfg.Username)
-	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.PostForm(endpoint, form)
-	if err != nil {
-		return "", fmt.Errorf("token request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	var tr microsoftTokenResponse
-	if err := json.Unmarshal(bodyBytes, &tr); err != nil {
-		return "", fmt.Errorf("failed to parse token JSON: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Microsoft token error [%s]: %s", tr.Error, tr.ErrorDesc)
-	}
-
-	cfg.AccessToken = tr.AccessToken
-	if tr.RefreshToken != "" {
-		cfg.RefreshToken = tr.RefreshToken
-	}
-	cfg.TokenExpiry = time.Now().Unix() + tr.ExpiresIn
-	_ = UpdateAccountTokens(cfg.Username, cfg.AccessToken, cfg.RefreshToken, cfg.TokenExpiry)
-
-	return cfg.AccessToken, nil
+// graphQueryEscape escapes a query parameter value; Graph expects %20 rather than '+' for spaces.
+func graphQueryEscape(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
 }
 
 func graphAPIRequest(cfg *AccountConfig, method, apiURL string, body []byte) ([]byte, error) {
-	token, err := getGraphAccessToken(cfg)
+	token, err := GetOrRefreshMicrosoftToken(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +132,7 @@ func graphAPIRequest(cfg *AccountConfig, method, apiURL string, body []byte) ([]
 			Error graphError `json:"error"`
 		}
 		if json.Unmarshal(respBytes, &gErr) == nil && gErr.Error.Message != "" {
-			return nil, fmt.Errorf("Microsoft Graph API [%s]: %s", gErr.Error.Code, gErr.Error.Message)
+			return nil, fmt.Errorf("Microsoft Graph API HTTP %d [%s]: %s", resp.StatusCode, gErr.Error.Code, gErr.Error.Message)
 		}
 		return nil, fmt.Errorf("Microsoft Graph API returned HTTP %d: %s", resp.StatusCode, string(respBytes))
 	}
@@ -165,15 +140,72 @@ func graphAPIRequest(cfg *AccountConfig, method, apiURL string, body []byte) ([]
 	return respBytes, nil
 }
 
+// resolveGraphFolder turns a folder name (as shown by ListFoldersGraph) into a Graph folder path segment.
+// Well-known names map directly; other names are looked up by display name; anything else is assumed to be a folder ID.
+func resolveGraphFolder(cfg *AccountConfig, folder string) (string, error) {
+	folder = strings.TrimSpace(folder)
+	if folder == "" {
+		return "inbox", nil
+	}
+	if wk, ok := graphWellKnownFolders[strings.ToLower(folder)]; ok {
+		return wk, nil
+	}
+
+	apiURL := fmt.Sprintf("%s/mailFolders?$filter=displayName%%20eq%%20'%s'&$select=id",
+		graphUserURL(*cfg), graphQueryEscape(strings.ReplaceAll(folder, "'", "''")))
+	data, err := graphAPIRequest(cfg, "GET", apiURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to look up folder %q: %w", folder, err)
+	}
+	var resp graphFolderListResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return "", err
+	}
+	if len(resp.Value) > 0 {
+		return url.PathEscape(resp.Value[0].ID), nil
+	}
+	return url.PathEscape(folder), nil
+}
+
+func formatGraphRecipient(r *graphRecipient) string {
+	if r == nil {
+		return ""
+	}
+	if r.EmailAddress.Name != "" && r.EmailAddress.Name != r.EmailAddress.Address {
+		return fmt.Sprintf("%s <%s>", r.EmailAddress.Name, r.EmailAddress.Address)
+	}
+	return r.EmailAddress.Address
+}
+
+func graphSummaries(accountName string, data []byte) ([]EmailSummary, error) {
+	var resp graphMessageListResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+
+	summaries := make([]EmailSummary, 0, len(resp.Value))
+	for _, m := range resp.Value {
+		t, _ := time.Parse(time.RFC3339, m.ReceivedDateTime)
+		summaries = append(summaries, EmailSummary{
+			Account:   accountName,
+			ID:        m.ID,
+			From:      formatGraphRecipient(m.From),
+			Subject:   m.Subject,
+			Date:      t,
+			Snippet:   m.BodyPreview,
+			MessageID: m.InternetMessageId,
+		})
+	}
+	return summaries, nil
+}
+
 func TestConnectionGraph(cfg AccountConfig) error {
-	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/mailFolders/inbox", url.PathEscape(cfg.Username))
-	_, err := graphAPIRequest(&cfg, "GET", url, nil)
+	_, err := graphAPIRequest(&cfg, "GET", graphUserURL(cfg)+"/mailFolders/inbox", nil)
 	return err
 }
 
 func ListFoldersGraph(cfg AccountConfig) ([]string, error) {
-	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/mailFolders?$top=50", url.PathEscape(cfg.Username))
-	data, err := graphAPIRequest(&cfg, "GET", url, nil)
+	data, err := graphAPIRequest(&cfg, "GET", graphUserURL(cfg)+"/mailFolders?$top=100&$select=displayName", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -183,106 +215,52 @@ func ListFoldersGraph(cfg AccountConfig) ([]string, error) {
 		return nil, err
 	}
 
+	// Return plain display names so they can be passed back as the folder argument.
 	var folders []string
 	for _, f := range resp.Value {
-		folders = append(folders, fmt.Sprintf("%s (unread: %d, total: %d)", f.DisplayName, f.UnreadItemCount, f.TotalItemCount))
+		folders = append(folders, f.DisplayName)
 	}
 	return folders, nil
 }
 
 func GetUnreadEmailsGraph(accountName string, cfg AccountConfig, folder string, limit int) ([]EmailSummary, error) {
-	if limit <= 0 {
-		limit = 10
+	limit = clampLimit(limit)
+
+	folderPath, err := resolveGraphFolder(&cfg, folder)
+	if err != nil {
+		return nil, err
 	}
 
-	folderPath := "mailFolders/inbox"
-	if folder != "" && !strings.EqualFold(folder, "INBOX") {
-		folderPath = fmt.Sprintf("mailFolders/%s", url.PathEscape(folder))
-	}
-
-	apiURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/%s/messages?$filter=isRead%%20eq%%20false&$top=%d&$select=id,subject,from,receivedDateTime,bodyPreview,internetMessageId&$orderby=receivedDateTime%%20desc",
-		url.PathEscape(cfg.Username), folderPath, limit)
+	// Graph rejects $orderby on a property that isn't also the first term of $filter
+	// (InefficientFilter), hence the always-true receivedDateTime clause.
+	apiURL := fmt.Sprintf("%s/mailFolders/%s/messages?$filter=receivedDateTime%%20ge%%201900-01-01T00:00:00Z%%20and%%20isRead%%20eq%%20false&$orderby=receivedDateTime%%20desc&$top=%d&$select=id,subject,from,receivedDateTime,bodyPreview,internetMessageId",
+		graphUserURL(cfg), folderPath, limit)
 
 	data, err := graphAPIRequest(&cfg, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-
-	var resp graphMessageListResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, err
-	}
-
-	var summaries []EmailSummary
-	for _, m := range resp.Value {
-		fromStr := ""
-		if m.From != nil {
-			if m.From.EmailAddress.Name != "" {
-				fromStr = fmt.Sprintf("%s <%s>", m.From.EmailAddress.Name, m.From.EmailAddress.Address)
-			} else {
-				fromStr = m.From.EmailAddress.Address
-			}
-		}
-
-		t, _ := time.Parse(time.RFC3339, m.ReceivedDateTime)
-
-		summaries = append(summaries, EmailSummary{
-			Account:   accountName,
-			ID:        m.ID,
-			From:      fromStr,
-			Subject:   m.Subject,
-			Date:      t,
-			Snippet:   m.BodyPreview,
-			MessageID: m.InternetMessageId,
-		})
-	}
-
-	return summaries, nil
+	return graphSummaries(accountName, data)
 }
 
 func SearchEmailsGraph(accountName string, cfg AccountConfig, query string, folder string, limit int) ([]EmailSummary, error) {
-	if limit <= 0 {
-		limit = 10
+	limit = clampLimit(limit)
+
+	folderPath, err := resolveGraphFolder(&cfg, folder)
+	if err != nil {
+		return nil, err
 	}
 
-	apiURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/messages?$search=\"%s\"&$top=%d&$select=id,subject,from,receivedDateTime,bodyPreview,internetMessageId",
-		url.PathEscape(cfg.Username), url.QueryEscape(query), limit)
+	// $search takes a double-quoted KQL string; embedded quotes must be backslash-escaped.
+	escaped := strings.ReplaceAll(strings.ReplaceAll(query, `\`, `\\`), `"`, `\"`)
+	apiURL := fmt.Sprintf("%s/mailFolders/%s/messages?$search=%s&$top=%d&$select=id,subject,from,receivedDateTime,bodyPreview,internetMessageId",
+		graphUserURL(cfg), folderPath, graphQueryEscape(`"`+escaped+`"`), limit)
 
 	data, err := graphAPIRequest(&cfg, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-
-	var resp graphMessageListResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, err
-	}
-
-	var summaries []EmailSummary
-	for _, m := range resp.Value {
-		fromStr := ""
-		if m.From != nil {
-			if m.From.EmailAddress.Name != "" {
-				fromStr = fmt.Sprintf("%s <%s>", m.From.EmailAddress.Name, m.From.EmailAddress.Address)
-			} else {
-				fromStr = m.From.EmailAddress.Address
-			}
-		}
-
-		t, _ := time.Parse(time.RFC3339, m.ReceivedDateTime)
-
-		summaries = append(summaries, EmailSummary{
-			Account:   accountName,
-			ID:        m.ID,
-			From:      fromStr,
-			Subject:   m.Subject,
-			Date:      t,
-			Snippet:   m.BodyPreview,
-			MessageID: m.InternetMessageId,
-		})
-	}
-
-	return summaries, nil
+	return graphSummaries(accountName, data)
 }
 
 func ReadEmailGraph(accountName string, cfg AccountConfig, id string, maxBodyLen int) (*EmailDetail, error) {
@@ -290,8 +268,8 @@ func ReadEmailGraph(accountName string, cfg AccountConfig, id string, maxBodyLen
 		maxBodyLen = defaultMaxBodyLen
 	}
 
-	apiURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/messages/%s?$expand=attachments($select=id,name,contentType,size)",
-		url.PathEscape(cfg.Username), url.PathEscape(id))
+	apiURL := fmt.Sprintf("%s/messages/%s?$expand=attachments($select=id,name,contentType,size)",
+		graphUserURL(cfg), url.PathEscape(id))
 
 	data, err := graphAPIRequest(&cfg, "GET", apiURL, nil)
 	if err != nil {
@@ -303,21 +281,12 @@ func ReadEmailGraph(accountName string, cfg AccountConfig, id string, maxBodyLen
 		return nil, err
 	}
 
-	fromStr := ""
-	if m.From != nil {
-		if m.From.EmailAddress.Name != "" {
-			fromStr = fmt.Sprintf("%s <%s>", m.From.EmailAddress.Name, m.From.EmailAddress.Address)
-		} else {
-			fromStr = m.From.EmailAddress.Address
-		}
-	}
-
 	var toList, ccList []string
-	for _, to := range m.ToRecipients {
-		toList = append(toList, fmt.Sprintf("%s <%s>", to.EmailAddress.Name, to.EmailAddress.Address))
+	for i := range m.ToRecipients {
+		toList = append(toList, formatGraphRecipient(&m.ToRecipients[i]))
 	}
-	for _, cc := range m.CcRecipients {
-		ccList = append(ccList, fmt.Sprintf("%s <%s>", cc.EmailAddress.Name, cc.EmailAddress.Address))
+	for i := range m.CcRecipients {
+		ccList = append(ccList, formatGraphRecipient(&m.CcRecipients[i]))
 	}
 
 	bodyContent := ""
@@ -328,9 +297,7 @@ func ReadEmailGraph(accountName string, cfg AccountConfig, id string, maxBodyLen
 			bodyContent = m.Body.Content
 		}
 	}
-	if len(bodyContent) > maxBodyLen {
-		bodyContent = bodyContent[:maxBodyLen] + "\n...[truncated by kgmail]"
-	}
+	bodyContent = truncateBody(strings.TrimSpace(bodyContent), maxBodyLen)
 
 	var attNames []string
 	for _, a := range m.Attachments {
@@ -345,7 +312,7 @@ func ReadEmailGraph(accountName string, cfg AccountConfig, id string, maxBodyLen
 		Account:     accountName,
 		ID:          m.ID,
 		MessageID:   m.InternetMessageId,
-		From:        fromStr,
+		From:        formatGraphRecipient(m.From),
 		To:          toList,
 		Cc:          ccList,
 		Subject:     m.Subject,
@@ -355,48 +322,67 @@ func ReadEmailGraph(accountName string, cfg AccountConfig, id string, maxBodyLen
 	}, nil
 }
 
-func SendEmailGraph(cfg AccountConfig, to []string, subject, body string, isHTML bool) error {
-	apiURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/sendMail", url.PathEscape(cfg.Username))
-
-	type recipientObj struct {
-		EmailAddress struct {
-			Address string `json:"address"`
-		} `json:"emailAddress"`
-	}
-
-	var recipients []recipientObj
-	for _, addr := range to {
-		r := recipientObj{}
-		r.EmailAddress.Address = addr
+func graphRecipients(addrs []*mail.Address) []graphRecipient {
+	recipients := make([]graphRecipient, 0, len(addrs))
+	for _, addr := range addrs {
+		var r graphRecipient
+		r.EmailAddress.Name = addr.Name
+		r.EmailAddress.Address = addr.Address
 		recipients = append(recipients, r)
 	}
+	return recipients
+}
 
-	contentType := "Text"
-	if isHTML {
-		contentType = "HTML"
+func SendEmailGraph(cfg AccountConfig, msg OutgoingEmail) error {
+	if msg.InReplyTo != "" {
+		return fmt.Errorf("replying in-thread (in_reply_to) is not supported for Microsoft Graph accounts yet")
 	}
 
-	payload := map[string]any{
-		"message": map[string]any{
-			"subject": subject,
-			"body": map[string]string{
-				"contentType": contentType,
-				"content":     body,
-			},
-			"toRecipients": recipients,
-		},
-		"saveToSentItems": true,
+	to, err := parseAddresses(msg.To)
+	if err != nil {
+		return err
 	}
-
-	bodyBytes, err := json.Marshal(payload)
+	cc, err := parseAddresses(msg.Cc)
+	if err != nil {
+		return err
+	}
+	bcc, err := parseAddresses(msg.Bcc)
 	if err != nil {
 		return err
 	}
 
-	_, err = graphAPIRequest(&cfg, "POST", apiURL, bodyBytes)
+	contentType := "Text"
+	if msg.IsHTML {
+		contentType = "HTML"
+	}
+
+	message := map[string]any{
+		"subject": msg.Subject,
+		"body": map[string]string{
+			"contentType": contentType,
+			"content":     msg.Body,
+		},
+		"toRecipients": graphRecipients(to),
+	}
+	if len(cc) > 0 {
+		message["ccRecipients"] = graphRecipients(cc)
+	}
+	if len(bcc) > 0 {
+		message["bccRecipients"] = graphRecipients(bcc)
+	}
+
+	bodyBytes, err := json.Marshal(map[string]any{
+		"message":         message,
+		"saveToSentItems": true,
+	})
 	if err != nil {
-		if strings.Contains(err.Error(), "ErrorAccessDenied") || strings.Contains(err.Error(), "403") {
-			return fmt.Errorf("sending email failed: Azure App %s lacks 'Mail.Send' permission in tenant %s (granted permissions: Mail.Read, Mail.ReadWrite)", cfg.ClientID, cfg.TenantID)
+		return err
+	}
+
+	_, err = graphAPIRequest(&cfg, "POST", graphUserURL(cfg)+"/sendMail", bodyBytes)
+	if err != nil {
+		if strings.Contains(err.Error(), "ErrorAccessDenied") || strings.Contains(err.Error(), "HTTP 403") {
+			return fmt.Errorf("sending email failed: Azure App %s likely lacks the 'Mail.Send' permission in tenant %s: %w", cfg.ClientID, cfg.TenantID, err)
 		}
 		return err
 	}

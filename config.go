@@ -6,7 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+// configMu serializes read-modify-write updates of the config file within this
+// process (e.g. several accounts refreshing tokens in parallel).
+var configMu sync.Mutex
 
 // AccountConfig defines the settings for an individual email account.
 type AccountConfig struct {
@@ -33,6 +38,10 @@ type AccountConfig struct {
 	AccessToken  string `json:"access_token,omitempty"`  // Cached access token (managed by kgmail)
 	RefreshToken string `json:"refresh_token,omitempty"` // Refresh token (managed by kgmail)
 	TokenExpiry  int64  `json:"token_expiry,omitempty"`  // Unix timestamp when access token expires
+
+	// Name is the account's key in Config.Accounts. It is filled in by LoadConfig
+	// and used to persist refreshed tokens to the right entry.
+	Name string `json:"-"`
 }
 
 // IsOAuth2 returns true when the account is configured for OAuth2 (has tenant+client IDs).
@@ -122,6 +131,7 @@ func LoadConfig() (*Config, string, error) {
 	// Normalize account defaults
 	for name, acc := range cfg.Accounts {
 		acc = normalizeAccount(acc)
+		acc.Name = name
 		cfg.Accounts[name] = acc
 	}
 
@@ -144,7 +154,28 @@ func SaveConfig(cfg *Config, targetPath string) error {
 		return fmt.Errorf("failed to serialize config JSON: %w", err)
 	}
 
-	if err := os.WriteFile(targetPath, data, 0600); err != nil {
+	// Write to a temp file and rename it into place so concurrent readers
+	// (e.g. the MCP server) never observe a partially written config. This also
+	// resets the permissions of an existing file to 0600.
+	tmp, err := os.CreateTemp(dir, ".config-*.json")
+	if err != nil {
+		return fmt.Errorf("failed to create temp config in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to set config permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to write config to %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to write config to %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("failed to write config to %s: %w", targetPath, err)
 	}
 
@@ -219,30 +250,30 @@ func normalizeAccount(acc AccountConfig) AccountConfig {
 	return acc
 }
 
-// UpdateAccountTokens saves updated OAuth2 access/refresh tokens for an account back to disk.
-func UpdateAccountTokens(identifier string, accessToken, refreshToken string, expiry int64) error {
+// UpdateAccountTokens saves updated OAuth2 access/refresh tokens for the named account back to disk.
+func UpdateAccountTokens(name string, accessToken, refreshToken string, expiry int64) error {
+	if name == "" {
+		return fmt.Errorf("cannot persist tokens: account name is empty")
+	}
+
+	configMu.Lock()
+	defer configMu.Unlock()
+
 	cfg, cfgPath, err := LoadConfig()
 	if err != nil {
 		return err
 	}
 
-	found := false
-	for name, acc := range cfg.Accounts {
-		if name == identifier || strings.EqualFold(acc.Username, identifier) {
-			acc.AccessToken = accessToken
-			if refreshToken != "" {
-				acc.RefreshToken = refreshToken
-			}
-			acc.TokenExpiry = expiry
-			cfg.Accounts[name] = acc
-			found = true
-			break
-		}
+	acc, ok := cfg.Accounts[name]
+	if !ok {
+		return fmt.Errorf("account %s not found in configuration", name)
 	}
-
-	if !found {
-		return fmt.Errorf("account %s not found in configuration", identifier)
+	acc.AccessToken = accessToken
+	if refreshToken != "" {
+		acc.RefreshToken = refreshToken
 	}
+	acc.TokenExpiry = expiry
+	cfg.Accounts[name] = acc
 
 	return SaveConfig(cfg, cfgPath)
 }
