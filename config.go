@@ -64,6 +64,9 @@ func (a AccountConfig) IsGraph() bool {
 // Config represents the top-level configuration file.
 type Config struct {
 	Accounts map[string]AccountConfig `json:"accounts"`
+	// AttachmentDirs lists the folders MCP clients may attach files from
+	// (default: ~/Downloads, ~/Documents, ~/Desktop, ~/.workspace-mcp/attachments).
+	AttachmentDirs []string `json:"attachment_dirs,omitempty"`
 }
 
 // DefaultConfigPath returns ~/.kgmail/config.json

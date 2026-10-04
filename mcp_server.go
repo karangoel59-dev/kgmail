@@ -186,6 +186,7 @@ func BuildMCPServer() *server.MCPServer {
 		mcp.WithString("body", mcp.Required(), mcp.Description("Email body content")),
 		mcp.WithBoolean("is_html", mcp.Description("Set to true if body contains HTML (default: false)")),
 		mcp.WithString("in_reply_to", mcp.Description("Message-ID of the email being replied to (from read_email), to keep the reply in the same thread. SMTP accounts only.")),
+		mcp.WithArray("attachments", mcp.WithStringItems(), mcp.Description(fmt.Sprintf("Absolute paths of local files to attach (max %d MB total; %d MB for Microsoft Graph accounts). Files must be in an allowed folder: by default ~/Downloads, ~/Documents, ~/Desktop, or ~/.workspace-mcp/attachments (Google Drive downloads).", maxAttachmentBytes>>20, maxGraphAttachmentBytes>>20))),
 		mcp.WithReadOnlyHintAnnotation(false),
 		mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithIdempotentHintAnnotation(false),
@@ -517,10 +518,21 @@ func handleSendEmail(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolR
 		return mcp.NewToolResultError(fmt.Sprintf("Account '%s' not found", account)), nil
 	}
 
+	// Agents may only attach files from the allowed folders
+	attachments, err := loadAttachments(argStringSlice(r, "attachments"), cfg.attachmentDirs())
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to attach files: %v", err)), nil
+	}
+	msg.Attachments = attachments
+
 	if err := SendEmail(acc, msg); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to send email: %v", err)), nil
 	}
 
 	recipients := append(append(append([]string{}, msg.To...), msg.Cc...), msg.Bcc...)
-	return mcp.NewToolResultText(fmt.Sprintf("✅ Email successfully sent to %s via %s.", strings.Join(recipients, ", "), account)), nil
+	result := fmt.Sprintf("✅ Email successfully sent to %s via %s.", strings.Join(recipients, ", "), account)
+	if len(attachments) > 0 {
+		result += fmt.Sprintf("\nAttached %d file(s): %s", len(attachments), describeAttachments(attachments))
+	}
+	return mcp.NewToolResultText(result), nil
 }
