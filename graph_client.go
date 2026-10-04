@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -414,6 +415,27 @@ func graphRecipients(addrs []*mail.Address) []graphRecipient {
 	return recipients
 }
 
+// graphFileAttachments converts attachments to Graph fileAttachment objects. They are sent
+// inline with sendMail, which limits the combined size (larger files would need an upload session).
+func graphFileAttachments(attachments []Attachment) ([]map[string]string, error) {
+	total := 0
+	files := make([]map[string]string, 0, len(attachments))
+	for _, a := range attachments {
+		total += len(a.Data)
+		files = append(files, map[string]string{
+			"@odata.type":  "#microsoft.graph.fileAttachment",
+			"name":         a.Name,
+			"contentType":  a.ContentType,
+			"contentBytes": base64.StdEncoding.EncodeToString(a.Data),
+		})
+	}
+	if total > maxGraphAttachmentBytes {
+		return nil, fmt.Errorf("attachments total %s; Microsoft Graph accounts currently support up to %d MB of attachments per email",
+			formatSize(total), maxGraphAttachmentBytes>>20)
+	}
+	return files, nil
+}
+
 func SendEmailGraph(cfg AccountConfig, msg OutgoingEmail) error {
 	if msg.InReplyTo != "" {
 		return fmt.Errorf("replying in-thread (in_reply_to) is not supported for Microsoft Graph accounts yet")
@@ -450,6 +472,13 @@ func SendEmailGraph(cfg AccountConfig, msg OutgoingEmail) error {
 	}
 	if len(bcc) > 0 {
 		message["bccRecipients"] = graphRecipients(bcc)
+	}
+	if len(msg.Attachments) > 0 {
+		files, err := graphFileAttachments(msg.Attachments)
+		if err != nil {
+			return err
+		}
+		message["attachments"] = files
 	}
 
 	bodyBytes, err := json.Marshal(map[string]any{

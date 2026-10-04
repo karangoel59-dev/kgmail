@@ -60,6 +60,7 @@ EXAMPLES:
   # Send an email (optionally as a threaded reply):
   kgmail send --account google --to a@x.com --cc b@x.com --subject "Hi" --body "Hello"
   kgmail send --account google --to a@x.com --subject "Re: Hi" --body "Thanks" --in-reply-to "<id@x.com>"
+  kgmail send --account google --to a@x.com --subject "Report" --body "Attached" --attach ~/Documents/report.pdf
 
   # Add an account with password / app password:
   kgmail add-account personal --provider gmail --user myemail@gmail.com --password <token>
@@ -301,6 +302,12 @@ func printSummaries(summaries []EmailSummary) {
 	}
 }
 
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ", ") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+
 func splitAddressList(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
@@ -474,10 +481,12 @@ func runSend() {
 	body := fs.String("body", "", "Email body text")
 	isHTML := fs.Bool("html", false, "Body is HTML")
 	inReplyTo := fs.String("in-reply-to", "", "Message-ID of the email being replied to (threads the reply)")
+	var attach stringList
+	fs.Var(&attach, "attach", "File to attach (repeat for several files)")
 	fs.Parse(os.Args[2:])
 
 	if *account == "" || *to == "" || *subject == "" || *body == "" {
-		fmt.Println("Usage: kgmail send --account <acc> --to <recipient> --subject <subj> --body <body> [--cc <addrs>] [--bcc <addrs>] [--in-reply-to <message-id>] [--html]")
+		fmt.Println("Usage: kgmail send --account <acc> --to <recipient> --subject <subj> --body <body> [--cc <addrs>] [--bcc <addrs>] [--in-reply-to <message-id>] [--attach <file>]... [--html]")
 		os.Exit(1)
 	}
 
@@ -493,14 +502,22 @@ func runSend() {
 		os.Exit(1)
 	}
 
+	// The CLI is driven by the user directly, so any readable file may be attached
+	attachments, err := loadAttachments(attach, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to attach files: %v\n", err)
+		os.Exit(1)
+	}
+
 	msg := OutgoingEmail{
-		To:        splitAddressList(*to),
-		Cc:        splitAddressList(*cc),
-		Bcc:       splitAddressList(*bcc),
-		Subject:   *subject,
-		Body:      *body,
-		IsHTML:    *isHTML,
-		InReplyTo: *inReplyTo,
+		Attachments: attachments,
+		To:          splitAddressList(*to),
+		Cc:          splitAddressList(*cc),
+		Bcc:         splitAddressList(*bcc),
+		Subject:     *subject,
+		Body:        *body,
+		IsHTML:      *isHTML,
+		InReplyTo:   *inReplyTo,
 	}
 
 	if err := SendEmail(acc, msg); err != nil {
@@ -509,6 +526,9 @@ func runSend() {
 	}
 
 	fmt.Printf("✅ Email successfully sent to %s via %s.\n", *to, *account)
+	if len(attachments) > 0 {
+		fmt.Printf("   Attached: %s\n", describeAttachments(attachments))
+	}
 }
 
 func runAddAccount() {

@@ -49,7 +49,7 @@ func TestBuildMCPServer(t *testing.T) {
 	if h := send.Tool.Annotations.ReadOnlyHint; h == nil || *h {
 		t.Errorf("expected send_email not to be read-only")
 	}
-	for _, param := range []string{"cc", "bcc", "in_reply_to"} {
+	for _, param := range []string{"cc", "bcc", "in_reply_to", "attachments"} {
 		if _, ok := send.Tool.InputSchema.Properties[param]; !ok {
 			t.Errorf("expected send_email to accept %s", param)
 		}

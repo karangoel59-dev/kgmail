@@ -25,7 +25,8 @@ type OutgoingEmail struct {
 	IsHTML  bool
 	// InReplyTo is the Message-ID of the email being replied to (angle brackets optional).
 	// It sets the In-Reply-To and References headers so the reply is threaded.
-	InReplyTo string
+	InReplyTo   string
+	Attachments []Attachment
 }
 
 // parseAddresses parses each entry as an RFC 5322 address ("a@b.com" or "Name <a@b.com>").
@@ -102,22 +103,8 @@ func buildMessage(from string, msg OutgoingEmail) ([]byte, []string, error) {
 		h.SetMsgIDList("References", []string{id})
 	}
 
-	contentType := "text/plain"
-	if msg.IsHTML {
-		contentType = "text/html"
-	}
-	h.SetContentType(contentType, map[string]string{"charset": "utf-8"})
-	h.Set("Content-Transfer-Encoding", "quoted-printable")
-
 	var buf bytes.Buffer
-	w, err := mail.CreateSingleInlineWriter(&buf, h)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to build message: %w", err)
-	}
-	if _, err := w.Write([]byte(msg.Body)); err != nil {
-		return nil, nil, fmt.Errorf("failed to build message: %w", err)
-	}
-	if err := w.Close(); err != nil {
+	if err := writeBody(&buf, h, msg); err != nil {
 		return nil, nil, fmt.Errorf("failed to build message: %w", err)
 	}
 
@@ -128,6 +115,64 @@ func buildMessage(from string, msg OutgoingEmail) ([]byte, []string, error) {
 		}
 	}
 	return buf.Bytes(), rcpts, nil
+}
+
+// writeBody writes the header and body: a single text part, or multipart/mixed
+// with the text followed by the attachments.
+func writeBody(buf *bytes.Buffer, h mail.Header, msg OutgoingEmail) error {
+	contentType := "text/plain"
+	if msg.IsHTML {
+		contentType = "text/html"
+	}
+
+	if len(msg.Attachments) == 0 {
+		h.SetContentType(contentType, map[string]string{"charset": "utf-8"})
+		h.Set("Content-Transfer-Encoding", "quoted-printable")
+		w, err := mail.CreateSingleInlineWriter(buf, h)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte(msg.Body)); err != nil {
+			return err
+		}
+		return w.Close()
+	}
+
+	mw, err := mail.CreateWriter(buf, h)
+	if err != nil {
+		return err
+	}
+
+	var th mail.InlineHeader
+	th.SetContentType(contentType, map[string]string{"charset": "utf-8"})
+	th.Set("Content-Transfer-Encoding", "quoted-printable")
+	tw, err := mw.CreateSingleInline(th)
+	if err != nil {
+		return err
+	}
+	if _, err := tw.Write([]byte(msg.Body)); err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+
+	for _, a := range msg.Attachments {
+		var ah mail.AttachmentHeader
+		ah.SetContentType(a.ContentType, nil)
+		ah.SetFilename(a.Name)
+		aw, err := mw.CreateAttachment(ah)
+		if err != nil {
+			return err
+		}
+		if _, err := aw.Write(a.Data); err != nil {
+			return err
+		}
+		if err := aw.Close(); err != nil {
+			return err
+		}
+	}
+	return mw.Close()
 }
 
 func isLocalhost(host string) bool {

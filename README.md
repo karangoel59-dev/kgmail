@@ -29,7 +29,7 @@ A lightweight, high-performance Multi-Account Email Manager and native **Model C
 | `list_folders` | Lists all available mailboxes/folders for an account (e.g. INBOX, Sent, Archive, Spam) | `account` *(required)* |
 | `move_emails` | Moves emails into another folder to organize the mailbox; unread status is preserved and moves are reversible | `account` *(required)*, `message_ids` *(required)*, `destination` *(required)*, `folder`, `create_if_missing` |
 | `create_folder` | Creates a mail folder; use `/` for nested folders (e.g. `Receipts/2026`) | `account` *(required)*, `name` *(required)* |
-| `send_email` | Sends an email via SMTP (or Microsoft Graph for Graph accounts). Annotated as destructive so MCP clients can ask before sending | `account` *(required)*, `to` *(required)*, `subject` *(required)*, `body` *(required)*, `cc`, `bcc`, `is_html`, `in_reply_to` |
+| `send_email` | Sends an email via SMTP (or Microsoft Graph for Graph accounts). Annotated as destructive so MCP clients can ask before sending | `account` *(required)*, `to` *(required)*, `subject` *(required)*, `body` *(required)*, `cc`, `bcc`, `is_html`, `in_reply_to`, `attachments` |
 
 ---
 
@@ -108,6 +108,25 @@ go install github.com/karangoel59-dev/kgmail@latest
 
 > **Note for Gmail Users**: Gmail requires an **App Password** (generated under Google Account > Security > 2-Step Verification > App Passwords). Spaces in 16-character app passwords are automatically stripped.
 
+### 📎 Attachments
+
+`send_email` and `kgmail send --attach` attach local files (up to 18 MB in total; 3 MB for Microsoft Graph accounts).
+
+Because an AI agent decides which files to attach, the MCP tool only accepts files inside these folders, never hidden files or folders (such as `~/.ssh` or `~/.kgmail`), and checks the real path after following symlinks:
+
+`~/Downloads`, `~/Documents`, `~/Desktop`, `~/.workspace-mcp/attachments` (where the Google Drive MCP server saves downloads)
+
+To use different folders, set `attachment_dirs` at the top level of the config (this replaces the defaults):
+
+```json
+{
+  "attachment_dirs": ["~/Documents", "~/Work/outbox"],
+  "accounts": { ... }
+}
+```
+
+The CLI (`kgmail send --attach`) is run by you directly, so it can attach any readable file.
+
 ### 🏢 Microsoft 365 / Exchange Online OAuth 2.0 (Azure AD)
 
 Since Microsoft disabled Basic Auth / App Passwords for Exchange Online, organizational Microsoft 365 accounts use **OAuth 2.0 (XOAUTH2)** via Azure AD:
@@ -164,6 +183,9 @@ kgmail mkdir work "Projects/2026"
 
 # Send an email via SMTP
 kgmail send --account google --to colleague@example.com --subject "Meeting update" --body "See you at 3 PM."
+
+# Attach files (repeat --attach for several)
+kgmail send --account google --to a@example.com --subject "Report" --body "Attached." --attach ~/Documents/report.pdf --attach ~/Downloads/chart.png
 
 # Send with Cc/Bcc, or as a threaded reply (SMTP accounts)
 kgmail send --account google --to a@example.com --cc b@example.com --bcc c@example.com --subject "Hi" --body "Hello"
